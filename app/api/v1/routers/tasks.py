@@ -143,6 +143,8 @@ def resolve_mysql_to_mongodb_fields_for_task_create(task_data: TaskCreateMySQL) 
     MySQL: id, creatorparentid
     MongoDB: file_id, assigned_by
     """
+    logger.info(f"[FIELD-MAPPING-DEBUG] Input task_data - id: {task_data.id}, address: {task_data.address}")
+    
     # Create a copy of the request to modify
     task_dict = task_data.dict()
     
@@ -267,6 +269,10 @@ async def get_assignment_sources():
 @router.post("/create")
 async def create_task(task_data: TaskCreateMySQL):
     """Create a new task with embedding generation and stage detection (MySQL backward compatible)"""
+    logger.info(f"[TASK-CREATION-DEBUG] Starting task creation with address: {task_data.address}")
+    logger.info(f"[TASK-CREATION-DEBUG] Task description: {task_data.description}")
+    logger.info(f"[TASK-CREATION-DEBUG] Task title: {task_data.title}")
+    
     logger.info(f"[TASK-CREATE-START] Creating task: '{task_data.title[:50]}...', file_id={task_data.id}")
     
     # Apply MySQL to MongoDB field mapping
@@ -277,12 +283,25 @@ async def create_task(task_data: TaskCreateMySQL):
     # Validate file_id against MySQL permits table if provided
     mysql_permit_data = None
     if resolved_task_data.file_id:
-        logger.info(f"[DEBUG] Validating file_id {resolved_task_data.file_id} against MySQL permits table")
+        logger.info(f"[MYSQL-DEBUG] Validating file_id {resolved_task_data.file_id} against MySQL permits table")
         mysql_permit_data = mysql_service.get_permit_by_id(resolved_task_data.file_id)
         if not mysql_permit_data:
-            logger.warning(f"[DEBUG] File ID {resolved_task_data.file_id} not found in MySQL permits table, proceeding anyway")
+            logger.warning(f"[MYSQL-WARNING] File ID {resolved_task_data.file_id} not found in MySQL permits table")
         else:
-            logger.info(f"[DEBUG] Validated file_id {resolved_task_data.file_id} exists in MySQL permits table")
+            logger.info(f"[MYSQL-SUCCESS] Found permit in MySQL - ID: {mysql_permit_data.get('id')}, Name: {mysql_permit_data.get('name')}, Address: {mysql_permit_data.get('address')}")
+    else:
+        logger.info("[MYSQL-DEBUG] No file_id provided, skipping MySQL validation")
+    
+    # If no file_id but address is provided, try to find permit by address
+    if not resolved_task_data.file_id and task_data.address:
+        logger.info(f"[MYSQL-DEBUG] No file_id but address provided, looking up permit by address: {task_data.address}")
+        mysql_permit_data = mysql_service.get_permit_by_address(task_data.address)
+        if mysql_permit_data:
+            # Update resolved_task_data with the found file_id
+            resolved_task_data.file_id = str(mysql_permit_data.get('id'))
+            logger.info(f"[MYSQL-SUCCESS] Found permit by address - ID: {resolved_task_data.file_id}, Name: {mysql_permit_data.get('name')}")
+        else:
+            logger.warning(f"[MYSQL-WARNING] No permit found for address: {task_data.address}")
     
     # Generate task ID
     task_id = generate_task_id()
@@ -291,9 +310,9 @@ async def create_task(task_data: TaskCreateMySQL):
     task_text = f"{resolved_task_data.title}. {resolved_task_data.description}"
     logger.info(f"[DEBUG] Creating task with description: {task_text}")
     
-    # Determine tracking mode based on file_id presence
+    # Determine tracking mode based on file_id presence (after address lookup)
     tracking_mode = "FILE_BASED" if resolved_task_data.file_id else "STANDALONE"
-    logger.info(f"[TASK-CREATE-MODE] Tracking mode: {tracking_mode}")
+    logger.info(f"[TASK-CREATE-MODE] Tracking mode: {tracking_mode} (file_id: {resolved_task_data.file_id})")
     
     # Use context-aware stage detection if file_id is provided
     if resolved_task_data.file_id:
@@ -406,15 +425,18 @@ async def create_task(task_data: TaskCreateMySQL):
     # Ensure permit_files record exists in MongoDB when file_id is provided
     # This makes the file visible on the Permit Files page with correct name from MySQL
     if resolved_task_data.file_id:
+        logger.info(f"[PERMIT-FILES-DEBUG] Checking if permit_files record exists for file_id: {resolved_task_data.file_id}")
         try:
             existing_pf = db.permit_files.find_one({"file_id": resolved_task_data.file_id})
             if not existing_pf:
+                logger.info(f"[PERMIT-FILES-CREATE] Creating new permit_files record")
                 # Build permit_files doc from MySQL data if available, else minimal stub
                 permit_name = resolved_task_data.file_id
                 permit_address = ""
                 if mysql_permit_data:
                     permit_name = str(mysql_permit_data.get("fullname") or mysql_permit_data.get("name") or mysql_permit_data.get("file_name") or resolved_task_data.file_id)
                     permit_address = str(mysql_permit_data.get("address") or "")
+                    logger.info(f"[PERMIT-FILES-DATA] Using MySQL data - Name: {permit_name}, Address: {permit_address}")
                 
                 pf_doc = {
                     "file_id": resolved_task_data.file_id,

@@ -67,16 +67,12 @@ interface Column {
   tasks: TaskItem[];
 }
 
-// Mock columns removed - using real API data instead
-
 const statusColors = {
   OPEN: "bg-muted text-muted-foreground",
   ASSIGNED: "bg-primary/20 text-primary",
   IN_PROGRESS: "bg-warning/20 text-warning",
   DONE: "bg-success/20 text-success",
 };
-
-// TaskCard component removed - using inline rendering instead
 
 export default function TaskBoard() {
   const [assignedTasks, setAssignedTasks] = useState<TaskItem[]>([]);

@@ -116,14 +116,13 @@ export default function AutomationDashboard() {
 
   const loadAutomationStatus = async () => {
     try {
-      // Mock data - replace with actual API call
-      setAutomationStatus({
-        enabled: true,
-        total_assignments: 156,
-        success_rate: 94.2,
-        last_assignment: '2024-01-12T10:30:00Z',
-        avg_assignment_time: 2.3
-      });
+      const response = await fetch('/api/v1/automation/status');
+      if (response.ok) {
+        const data = await response.json();
+        setAutomationStatus(data);
+      } else {
+        console.error('Failed to load automation status');
+      }
     } catch (error) {
       console.error('Failed to load automation status:', error);
     }
