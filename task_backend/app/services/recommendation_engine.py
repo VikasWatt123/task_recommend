@@ -372,10 +372,20 @@ class RecommendationEngine:
             task_description or "", file_id, current_file_stage
         )
 
-        # Handle case where file is COMPLETED (detected_stage will be None)
+        # Handle case where file is COMPLETED
         if detected_stage is None:
-            logger.info(f"File {file_id} is in COMPLETED stage - no recommendations until moved to QC")
-            return []
+            # Check if this is a QC task for a completed file
+            description_lower = task_description.lower()
+            qc_keywords = ["qc", "quality check", "quality control", "review", "inspection", 
+                          "verify", "audit", "check quality", "quality review", "quality assurance"]
+            
+            if any(keyword in description_lower for keyword in qc_keywords):
+                logger.info(f"File {file_id} is COMPLETED but QC task requested - allowing QC recommendations")
+                # Return QC recommendations for completed files
+                return self._qc_priority_recommendations(employees, top_k)
+            else:
+                logger.info(f"File {file_id} is in COMPLETED stage - no recommendations until moved to QC")
+                return []
 
         # PRELIMS keywords should be routed to new joinees / low experience
         if detected_stage == FileStage.PRELIMS:
@@ -611,10 +621,21 @@ class RecommendationEngine:
                 task_description or "", file_id, current_file_stage
             )
 
-            # Handle case where file is COMPLETED (detected_stage will be None)
+            # Handle case where file is COMPLETED
             if detected_stage is None:
-                logger.info(f"File {file_id} is in COMPLETED stage - no recommendations until moved to QC")
-                return None
+                # Check if this is a QC task for a completed file
+                description_lower = task_description.lower()
+                qc_keywords = ["qc", "quality check", "quality control", "review", "inspection", 
+                              "verify", "audit", "check quality", "quality review", "quality assurance"]
+                
+                if any(keyword in description_lower for keyword in qc_keywords):
+                    logger.info(f"File {file_id} is COMPLETED but QC task requested - allowing QC assignment")
+                    # For QC work, prefer high experience
+                    employees.sort(key=lambda x: (-(x.get("experience_years", 0) or 0), x.get("active_task_count", 0)))
+                    reasoning = "File is COMPLETED - Assigned QC task to most experienced employee."
+                else:
+                    logger.info(f"File {file_id} is in COMPLETED stage - no recommendations until moved to QC")
+                    return None
 
             # For PRELIMS-like work, prefer low experience (new joinees) first.
             if detected_stage == FileStage.PRELIMS:

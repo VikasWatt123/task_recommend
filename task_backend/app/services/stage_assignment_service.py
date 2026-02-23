@@ -157,18 +157,13 @@ class StageAssignmentService:
     @staticmethod
     def detect_stage_from_description_with_context(task_description: str, file_id: str = None, current_file_stage: str = None) -> Optional[FileStage]:
         """
-        Enhanced stage detection that considers file context
-        - For COMPLETED files: QC keywords get priority, production keywords indicate QC review
-        - For other files: Normal keyword detection
+        Detect stage with context awareness for completed files
         """
-        from app.db.mongodb import get_db
-        
-        # First, get basic stage detection
+        # First, try normal detection
         detected_stage = StageAssignmentService.detect_stage_from_description(task_description)
         
-        # Check if file is in COMPLETED stage (either from parameter or database)
+        # Check if file is COMPLETED
         file_is_completed = False
-        
         if current_file_stage == 'COMPLETED':
             file_is_completed = True
         elif file_id:
@@ -178,13 +173,19 @@ class StageAssignmentService:
             if file_tracking and file_tracking.get('current_stage') == 'COMPLETED':
                 file_is_completed = True
         
-        # If file is COMPLETED, do not auto-assign to QC stage
-        # Manager must manually move file to QC stage first
+        # If file is COMPLETED, allow QC task creation
         if file_is_completed:
-            logger.info(f"File is COMPLETED. Stage detection disabled - manager must move file to QC stage before assigning QC tasks")
-            # Return None to indicate no stage should be auto-assigned
-            # The task assignment logic will handle this appropriately
-            return None
+            # Check if the task is for QC work
+            task_description_lower = task_description.lower()
+            qc_keywords = ["qc", "quality check", "quality control", "review", "inspection", 
+                          "verify", "audit", "check quality", "quality review", "quality assurance"]
+            
+            if any(keyword in task_description_lower for keyword in qc_keywords):
+                logger.info(f"File is COMPLETED but QC task requested - allowing QC assignment")
+                return FileStage.QC
+            else:
+                logger.info(f"File is COMPLETED and not a QC task - no stage assignment")
+                return None
         
         return detected_stage
     

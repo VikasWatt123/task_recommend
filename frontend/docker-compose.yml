@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  # Frontend
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: task_frontend
+    restart: unless-stopped
+    ports:
+      - "5018:80"  # External port 5018 -> Internal port 8080
+    networks:
+      - frontend_network
+
+networks:
+  frontend_network:
+    driver: bridge

@@ -1,57 +1,19 @@
 # Python
-venv/
 __pycache__/
 *.pyc
+venv/
 .env
 
-# Frontend
+# Node
 node_modules/
-dist/
-frontend/.env
+frontend/node_modules/
 
-# mysql prod-key
-prod-key.pem
-
-# Secrets
-service_account_key.json
-
-# Uploads
-uploads/
+# Logs
+*.log
+frontend/frontend.log
 
 # OS
 .DS_Store
 
-# Logs & Databases
-*.log
-*.db
-temporal.db
-worker.log
-server.log
-
-# Temporal Workflows (if not used)
-temporal_workflows/
-
-# Build & Distribution
-build/
-*.egg-info/
-.pytest_cache/
-
-# IDE & Editor
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Testing
-.coverage
-htmlcov/
-
-# ClickHouse
-clickhouse-config/
-
-# Documentation (optional)
-docs/
-*.md
-!README.md
-test_stage.py
-test_stage_local.py
+# Docker
+*.env
