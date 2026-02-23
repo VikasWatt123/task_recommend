@@ -2,7 +2,7 @@
 Task Management Router - MongoDB Based with Embeddings
 """
 from fastapi import APIRouter, HTTPException, Query
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 import uuid
@@ -13,6 +13,19 @@ import os
 # Add temporal_workflows to path
 sys.path.append('/home/user/smart_task_assignee/task_recommend/temporal_workflows')
 from app.db.mongodb import get_db
+from app.db.mysql import mysql_service
+
+def _code_variants(employee_code: str) -> list:
+    """Return list of possible employee code formats (with/without leading zeros)."""
+    return list({employee_code, employee_code.lstrip('0') or employee_code, employee_code.zfill(4)})
+
+from app.utils.validation import (
+    BusinessRuleValidator,
+    AddressValidator,
+    FileIdValidator,
+    TaskDescriptionValidator,
+    validate_and_extract_address_info
+)
 from app.services.vertex_ai_embeddings import get_embedding_service
 from app.services.recommendation_engine import get_recommendation_engine, EmployeeRecommendation
 from app.services.stage_assignment_service import StageAssignmentService
@@ -36,32 +49,178 @@ class TaskCreate(BaseModel):
     title: str
     description: str
     skills_required: Optional[List[str]] = []
-    permit_file_id: Optional[str] = None
+    file_id: Optional[str] = None  # Standardized field name (was permit_file_id)
     assigned_by: str
     due_date: Optional[str] = None
     estimated_hours: Optional[float] = None
     created_from: Optional[str] = "manual"
     assignment_source: Optional[str] = "manual"  # "smart" or "manual"
 
+class TaskCreateMySQL(BaseModel):
+    """Task creation model with MySQL backward compatibility"""
+    title: str
+    description: str
+    skills_required: Optional[List[str]] = []
+    file_id: Optional[str] = None  # MongoDB field
+    id: Optional[str] = None  # MySQL field for file_id
+    assigned_by: Optional[str] = None
+    creatorparentid: Optional[str] = None  # MySQL field for assigned_by
+    due_date: Optional[str] = None
+    estimated_hours: Optional[float] = None
+    created_from: Optional[str] = "manual"
+    assignment_source: Optional[str] = "manual"  # "smart" or "manual"
+    stage: Optional[str] = None  # MySQL field (will be ignored, auto-detected)
+
 class TaskAssign(BaseModel):
-    employee_code: str
-    assigned_by: str
+    employee_code: Optional[str] = None      # MongoDB field
+    kekaemployeenumber: Optional[str] = None  # MySQL field for employee_code
+    assigned_by: Optional[str] = None         # MongoDB field
+    creatorparentid: Optional[str] = None     # MySQL field for assigned_by
 
 # Task Recommendation Models
 class TaskRecommendationRequest(BaseModel):
+    # Original MongoDB fields
     task_description: str
     top_k: Optional[int] = 10
     min_similarity: Optional[float] = 0.5
+    permit_file_id: Optional[str] = None
     file_id: Optional[str] = None
+    address: Optional[str] = None  # NEW: Address input for ZIP extraction
     priority: Optional[str] = None
     required_skills: Optional[List[str]] = None
     filter_by_availability: Optional[bool] = True
     team_lead_code: Optional[str] = None
+    
+    # MySQL backward compatibility fields
+    id: Optional[str] = None  # MySQL permits.id → maps to permit_file_id
+    creatorparentid: Optional[str] = None  # MySQL permits.creatorparentid → maps to assigned_by
 
 class RecommendationResponse(BaseModel):
     recommendations: List[EmployeeRecommendation]
     total_found: int
     query_info: Dict[str, Any]
+
+def resolve_mysql_to_mongodb_fields_for_task_assign(assignment: TaskAssign) -> TaskAssign:
+    """
+    Backward compatibility function to map MySQL field names to MongoDB field names for task assignment
+    MySQL: kekaemployeenumber, creatorparentid
+    MongoDB: employee_code, assigned_by
+    """
+    # Create a copy of the assignment to modify
+    assignment_dict = assignment.dict()
+    
+    # Map MySQL fields to MongoDB fields
+    if assignment_dict.get('kekaemployeenumber') and not assignment_dict.get('employee_code'):
+        assignment_dict['employee_code'] = assignment_dict['kekaemployeenumber']
+        logger.info(f"Mapped MySQL 'kekaemployeenumber' to MongoDB 'employee_code': {assignment_dict['kekaemployeenumber']}")
+    
+    if assignment_dict.get('creatorparentid') and not assignment_dict.get('assigned_by'):
+        assignment_dict['assigned_by'] = assignment_dict['creatorparentid']
+        logger.info(f"Mapped MySQL 'creatorparentid' to MongoDB 'assigned_by': {assignment_dict['creatorparentid']}")
+    
+    # Remove MySQL-only fields that shouldn't be in the final TaskAssign
+    assignment_dict.pop('kekaemployeenumber', None)
+    assignment_dict.pop('creatorparentid', None)
+    
+    # Validate that required fields are present
+    if not assignment_dict.get('employee_code'):
+        raise HTTPException(
+            status_code=400,
+            detail="employee_code is required. Provide either 'employee_code' (MongoDB) or 'kekaemployeenumber' (MySQL)"
+        )
+    
+    if not assignment_dict.get('assigned_by'):
+        raise HTTPException(
+            status_code=400,
+            detail="assigned_by is required. Provide either 'assigned_by' (MongoDB) or 'creatorparentid' (MySQL)"
+        )
+    
+    return TaskAssign(**assignment_dict)
+
+def resolve_mysql_to_mongodb_fields_for_task_create(task_data: TaskCreateMySQL) -> TaskCreate:
+    """
+    Backward compatibility function to map MySQL field names to MongoDB field names for task creation
+    MySQL: id, creatorparentid
+    MongoDB: file_id, assigned_by
+    """
+    # Create a copy of the request to modify
+    task_dict = task_data.dict()
+    
+    # Map MySQL fields to MongoDB fields
+    if task_dict.get('id') and not task_dict.get('file_id'):
+        task_dict['file_id'] = task_dict['id']
+        logger.info(f"Mapped MySQL 'id' to MongoDB 'file_id': {task_dict['id']}")
+    
+    if task_dict.get('creatorparentid') and not task_dict.get('assigned_by'):
+        task_dict['assigned_by'] = task_dict['creatorparentid']
+        logger.info(f"Mapped MySQL 'creatorparentid' to MongoDB 'assigned_by': {task_dict['creatorparentid']}")
+    
+    # Remove MySQL-only fields that shouldn't be in TaskCreate
+    task_dict.pop('id', None)
+    task_dict.pop('creatorparentid', None)
+    task_dict.pop('stage', None)  # Stage is auto-detected
+    
+    # Validate that required fields are present
+    if not task_dict.get('assigned_by'):
+        raise HTTPException(
+            status_code=400,
+            detail="assigned_by is required. Provide either 'assigned_by' (MongoDB) or 'creatorparentid' (MySQL)"
+        )
+    
+    return TaskCreate(**task_dict)
+
+def resolve_mysql_to_mongodb_fields(request: TaskRecommendationRequest) -> TaskRecommendationRequest:
+    """
+    Backward compatibility function to map MySQL field names to MongoDB field names
+    MySQL: id, address, creatorparentid
+    MongoDB: permit_file_id, address, assigned_by
+    """
+    # Create a copy of the request to modify
+    request_dict = request.dict()
+    
+    # Map MySQL fields to MongoDB fields
+    if request_dict.get('id') and not request_dict.get('permit_file_id'):
+        request_dict['permit_file_id'] = request_dict['id']
+        logger.info(f"Mapped MySQL 'id' to MongoDB 'permit_file_id': {request_dict['id']}")
+    
+    # address field is same in both systems, no mapping needed
+    
+    if request_dict.get('creatorparentid'):
+        # Store creatorparentid for later use in task creation
+        request_dict['mysql_creatorparentid'] = request_dict['creatorparentid']
+        logger.info(f"Mapped MySQL 'creatorparentid' for later use: {request_dict['creatorparentid']}")
+    
+    return TaskRecommendationRequest(**request_dict)
+
+async def fetch_permit_from_mysql(id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch permit file details from MySQL database
+    """
+    try:
+        from app.db.mysql import MySQLService
+        mysql_service = MySQLService()
+        
+        with mysql_service.get_connection() as conn:
+            with conn.cursor() as cursor:
+                # Query the permit_files table (correct table name from your database)
+                cursor.execute("""
+                    SELECT id, name, address , postalcode, 
+                    FROM permits
+                    WHERE id = %s
+                """, (id,))
+                
+                result = cursor.fetchone()
+                if result:
+                    logger.info(f"Successfully fetched permit {id} from MySQL")
+                    return result
+                else:
+                    logger.warning(f"Permit {id} not found in MySQL permit_files table")
+                    return None
+                    
+    except Exception as e:
+        logger.warning(f"MySQL not available for permit fetch: {e}")
+        logger.info(f"Continuing without MySQL permit data for ID: {id}")
+        return None
 
 @router.get("/assignment-sources")
 async def get_assignment_sources():
@@ -90,9 +249,9 @@ async def get_assignment_sources():
     for task in tasks:
         task["_id"] = str(task["_id"])
         if "created_at" in task and task["created_at"]:
-            task["created_at"] = task["created_at"].isoformat()
+            task["created_at"] = task["created_at"].isoformat() + 'Z'
         if "assigned_at" in task and task["assigned_at"]:
-            task["assigned_at"] = task["assigned_at"].isoformat()
+            task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
     
     return {
         "success": True,
@@ -106,37 +265,76 @@ async def get_assignment_sources():
 
 
 @router.post("/create")
-async def create_task(task_data: TaskCreate):
-    """Create a new task with embedding generation and stage detection"""
+async def create_task(task_data: TaskCreateMySQL):
+    """Create a new task with embedding generation and stage detection (MySQL backward compatible)"""
+    logger.info(f"[TASK-CREATE-START] Creating task: '{task_data.title[:50]}...', file_id={task_data.id}")
+    
+    # Apply MySQL to MongoDB field mapping
+    resolved_task_data = resolve_mysql_to_mongodb_fields_for_task_create(task_data)
+    
     db = get_db()
+    
+    # Validate file_id against MySQL permits table if provided
+    mysql_permit_data = None
+    if resolved_task_data.file_id:
+        logger.info(f"[DEBUG] Validating file_id {resolved_task_data.file_id} against MySQL permits table")
+        mysql_permit_data = mysql_service.get_permit_by_id(resolved_task_data.file_id)
+        if not mysql_permit_data:
+            logger.warning(f"[DEBUG] File ID {resolved_task_data.file_id} not found in MySQL permits table, proceeding anyway")
+        else:
+            logger.info(f"[DEBUG] Validated file_id {resolved_task_data.file_id} exists in MySQL permits table")
     
     # Generate task ID
     task_id = generate_task_id()
     
     # Detect stage from task description with context
-    task_text = f"{task_data.title}. {task_data.description}"
+    task_text = f"{resolved_task_data.title}. {resolved_task_data.description}"
+    logger.info(f"[DEBUG] Creating task with description: {task_text}")
+    
+    # Determine tracking mode based on file_id presence
+    tracking_mode = "FILE_BASED" if resolved_task_data.file_id else "STANDALONE"
+    logger.info(f"[TASK-CREATE-MODE] Tracking mode: {tracking_mode}")
     
     # Use context-aware stage detection if file_id is provided
-    if task_data.permit_file_id:
+    if resolved_task_data.file_id:
         detected_stage = StageAssignmentService.detect_stage_from_description_with_context(
-            task_text, task_data.permit_file_id
+            task_text, resolved_task_data.file_id
         )
+        logger.info(f"[DEBUG] Stage detection with context - File: {resolved_task_data.file_id}, Result: {detected_stage}")
     else:
         detected_stage = StageAssignmentService.detect_stage_from_description(task_text)
+        logger.info(f"[TASK-CREATE-STAGE] Detected stage: {detected_stage}")
     
     # Validate stage transition if file_id is provided
     validation_error = None
     validation_warning = None
-    if task_data.permit_file_id and detected_stage:
+    
+    # Handle case where stage detection returns None (file is COMPLETED)
+    if resolved_task_data.file_id and not detected_stage:
+        # Check if file is in COMPLETED stage
+        file_tracking = db.file_tracking.find_one({'file_id': resolved_task_data.file_id})
+        if file_tracking and file_tracking.get('current_stage') == 'COMPLETED':
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {resolved_task_data.file_id} is in COMPLETED stage. Manager must move file to QC stage before assigning tasks. Use /api/v1/stage-tracking/move-to-qc/{resolved_task_data.file_id}"
+            )
+    
+    if resolved_task_data.file_id and detected_stage:
         is_valid, error_msg = StageAssignmentService.check_stage_transition_validity(
-            task_data.permit_file_id, detected_stage
+            resolved_task_data.file_id, detected_stage
         )
         if not is_valid:
             validation_error = error_msg
-            logger.warning(f"Stage validation failed for file {task_data.permit_file_id}: {error_msg}")
+            logger.warning(f"Stage validation failed for file {resolved_task_data.file_id}: {error_msg}")
             
-            # Provide specific warnings based on stage
-            if detected_stage == FileStage.PRODUCTION:
+            # PRELIMS duplicate is a hard block — file already passed that stage
+            if detected_stage == FileStage.PRELIMS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {resolved_task_data.file_id} has already passed PRELIMS stage. Cannot create another PRELIMS task for this file."
+                )
+            # Other stage order violations are warnings (allow creation but warn)
+            elif detected_stage == FileStage.PRODUCTION:
                 validation_warning = "This file has not completed its PRELIMS stage. Complete the PRELIMS stage before moving to PRODUCTION."
             elif detected_stage == FileStage.QC:
                 validation_warning = "This file has not completed its PRODUCTION stage. Complete the PRODUCTION stage before moving to QUALITY."
@@ -147,55 +345,128 @@ async def create_task(task_data: TaskCreate):
     embedding_service = get_embedding_service()
     task_embedding = embedding_service.generate_embedding(task_text)
     
-    # Determine SLA eligibility
-    sla_applicable = bool(task_data.permit_file_id and task_data.permit_file_id.strip())
+    # Determine SLA eligibility (only for file-based tracking)
+    sla_applicable = bool(resolved_task_data.file_id and resolved_task_data.file_id.strip())
     
     # Create task document
     task = {
         "task_id": task_id,
-        "title": task_data.title,
-        "description": task_data.description,
-        "skills_required": task_data.skills_required,
+        "title": resolved_task_data.title,
+        "description": resolved_task_data.description,
+        "skills_required": resolved_task_data.skills_required,
         "source": {
-            "permit_file_id": task_data.permit_file_id,
-            "created_from": task_data.created_from or "manual",
-            "assignment_source": task_data.assignment_source or "manual"  # Track if smart or manual
+            "permit_file_id": resolved_task_data.file_id,  # Keep for backward compatibility
+            "created_from": resolved_task_data.created_from or "manual",
+            "assignment_source": resolved_task_data.assignment_source or "manual"  # Track if smart or manual
         },
-        "assigned_by": task_data.assigned_by,
+        "assigned_by": resolved_task_data.assigned_by,
         "assigned_to": None,
         "status": "OPEN",
-        "due_date": task_data.due_date,
-        "estimated_hours": task_data.estimated_hours,
+        "due_date": resolved_task_data.due_date,
+        "estimated_hours": resolved_task_data.estimated_hours,
         "stage": detected_stage.value if detected_stage else None,
         "sla_applicable": sla_applicable,
-        "file_id": task_data.permit_file_id if sla_applicable else None,
+        "file_id": resolved_task_data.file_id,  # Standardized field
+        "tracking_mode": tracking_mode,  # FILE_BASED or STANDALONE
         "stage_validation": {
             "detected_stage": detected_stage.value if detected_stage else None,
             "validation_error": validation_error,
-            "validated_at": datetime.utcnow() if validation_error else None
+            "validated_at": datetime.now(timezone.utc) if validation_error else None
         },
         "embeddings": {
             "description_embedding": task_embedding,
             "embedded_text": task_text,
             "model": "text-embedding-004",
             "dimension": len(task_embedding),
-            "created_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc)
         },
         "metadata": {
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc)
         }
     }
     
     # Insert into MongoDB
     db.tasks.insert_one(task)
+    logger.info(f"[TASK-CREATE-SUCCESS] Task created: {task_id}, mode={tracking_mode}, stage={detected_stage}")
+    
+    # Initialize file_tracking if this is the first task for this file
+    # This ensures check_stage_transition_validity has data for subsequent tasks
+    if resolved_task_data.file_id and detected_stage:
+        try:
+            from app.services.stage_tracking_service import get_stage_tracking_service
+            stage_service = get_stage_tracking_service()
+            existing_tracking = stage_service.get_file_tracking(resolved_task_data.file_id)
+            if not existing_tracking:
+                stage_service.initialize_file_tracking(resolved_task_data.file_id, detected_stage)
+                logger.info(f"[STAGE-TRACKING] Initialized file_tracking for {resolved_task_data.file_id} at {detected_stage}")
+        except Exception as ft_err:
+            logger.warning(f"[STAGE-TRACKING-WARN] Could not initialize file_tracking: {ft_err}")
+    
+    # Ensure permit_files record exists in MongoDB when file_id is provided
+    # This makes the file visible on the Permit Files page with correct name from MySQL
+    if resolved_task_data.file_id:
+        try:
+            existing_pf = db.permit_files.find_one({"file_id": resolved_task_data.file_id})
+            if not existing_pf:
+                # Build permit_files doc from MySQL data if available, else minimal stub
+                permit_name = resolved_task_data.file_id
+                permit_address = ""
+                if mysql_permit_data:
+                    permit_name = str(mysql_permit_data.get("fullname") or mysql_permit_data.get("name") or mysql_permit_data.get("file_name") or resolved_task_data.file_id)
+                    permit_address = str(mysql_permit_data.get("address") or "")
+                
+                pf_doc = {
+                    "file_id": resolved_task_data.file_id,
+                    "mysql_id": str(resolved_task_data.file_id),
+                    "file_name": permit_name,
+                    "file_info": {
+                        "original_filename": permit_name,
+                        "uploaded_at": datetime.now(timezone.utc).isoformat()
+                    },
+                    "project_details": {
+                        "client_name": permit_name,
+                        "project_name": detected_stage.value if detected_stage else "PRELIMS",
+                    },
+                    "address": permit_address,
+                    "status": "IN_PRELIMS",
+                    "workflow_step": detected_stage.value if detected_stage else "PRELIMS",
+                    "assigned_to_lead": None,
+                    "current_stage": detected_stage.value if detected_stage else "PRELIMS",
+                    "acceptance": {
+                        "accepted_by": None,
+                        "accepted_at": None
+                    },
+                    "metadata": {
+                        "created_at": datetime.now(timezone.utc),
+                        "updated_at": datetime.now(timezone.utc),
+                        "uploaded_by": resolved_task_data.assigned_by or "system",
+                        "source": "mysql_task_create",
+                    },
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                db.permit_files.insert_one(pf_doc)
+                logger.info(f"[PERMIT-FILE-CREATED] Auto-created permit_files record for file_id={resolved_task_data.file_id} name='{permit_name}'")
+            else:
+                logger.info(f"[PERMIT-FILE-EXISTS] permit_files record already exists for file_id={resolved_task_data.file_id}")
+        except Exception as pf_err:
+            logger.warning(f"[PERMIT-FILE-WARN] Could not ensure permit_files record: {pf_err}")
     
     response = {
         "task_id": task_id,
         "status": "OPEN",
         "message": "Task created successfully with embedding",
+        "tracking_mode": tracking_mode,
         "detected_stage": detected_stage.value if detected_stage else None,
-        "validation_warning": validation_warning
+        "validation_warning": validation_warning,
+        "mysql_fields_mapped": {
+            "id": task_data.id,
+            "creatorparentid": task_data.creatorparentid,
+            "mapped_to": {
+                "file_id": resolved_task_data.file_id,
+                "assigned_by": resolved_task_data.assigned_by
+            }
+        }
     }
     
     return response
@@ -205,6 +476,11 @@ async def get_task_recommendations(request: TaskRecommendationRequest) -> Recomm
     """
     Get AI-powered employee recommendations for a task using Vertex AI Gemini embeddings
     
+    Enhanced with MySQL backward compatibility:
+    - Accepts MySQL field names: id, address, creatorparentid
+    - Auto-fetches permit details from MySQL permits table
+    - Maps to MongoDB field names for processing
+    
     Performance improvements:
     - Parallel data fetching (embedding generation + employee data)
     - Smart caching (5-minute TTL for employee data)
@@ -212,1628 +488,859 @@ async def get_task_recommendations(request: TaskRecommendationRequest) -> Recomm
     - Batch operations
     
     This endpoint:
-    1. Generates embeddings for the task description using Gemini (parallel)
-    2. Loads employee data with caching (parallel)
-    3. Computes vectorized similarities
-    4. Returns top matching employees with similarity scores
+    1. Maps MySQL fields to MongoDB fields (backward compatibility)
+    2. Fetches permit details from MySQL if MySQL ID provided
+    3. Generates embeddings for the task description using Gemini (parallel)
+    4. Loads employee data with caching (parallel)
+    5. Computes vectorized similarities
+    6. Returns top matching employees with similarity scores
     """
     start_time = time.time()
+    logger.info(f"[RECOMMEND-START] Task recommendation request received: task_description='{request.task_description[:50]}...', address='{request.address}', file_id={request.file_id or request.permit_file_id}")
     
     try:
+        # Step 0: Validate request inputs
+        logger.info("[RECOMMEND-VALIDATION] Validating inputs: task_description, address, file_id")
+        validation_result = BusinessRuleValidator.validate_task_assignment_request(
+            task_description=request.task_description,
+            address=request.address,
+            file_id=request.file_id or request.permit_file_id,
+            team_lead_code=request.team_lead_code
+        )
+        
+        # Log validation warnings
+        if validation_result.warnings:
+            for warning in validation_result.warnings:
+                logger.warning(f"[VALIDATION] {warning}")
+        
+        # Return error if validation failed
+        if not validation_result.is_valid:
+            logger.error(f"[VALIDATION] Request validation failed: {validation_result.error_message}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Validation error: {validation_result.error_message}"
+            )
+        
+        # Step 1: Apply MySQL to MongoDB field mapping
+        resolved_request = resolve_mysql_to_mongodb_fields(request)
+        
+        # Step 2: Query MySQL permits table based on input
+        permit_data = None
+        mysql_file_id = None
+        
+        # Case 1: File ID provided (unique, no address check needed)
+        if resolved_request.permit_file_id:
+            logger.info(f"File ID provided: {resolved_request.permit_file_id}, querying MySQL permits table")
+            permit_data = mysql_service.get_permit_by_id(resolved_request.permit_file_id)
+            if permit_data:
+                mysql_file_id = str(permit_data.get('id'))
+                logger.info(f"Found permit in MySQL: id={mysql_file_id}, address={permit_data.get('address')}")
+            else:
+                logger.warning(f"File ID {resolved_request.permit_file_id} not found in MySQL permits table")
+        
+        # Case 2: Address provided (query MySQL to get file_id)
+        elif resolved_request.address:
+            logger.info(f"Address provided: {resolved_request.address}, querying MySQL permits table")
+            permit_data = mysql_service.get_permit_by_address(resolved_request.address)
+            if permit_data:
+                mysql_file_id = str(permit_data.get('id'))
+                logger.info(f"Found permit by address in MySQL: id={mysql_file_id}")
+                # Update resolved_request with the found file_id
+                request_dict = resolved_request.dict()
+                request_dict['permit_file_id'] = mysql_file_id
+                request_dict['file_id'] = mysql_file_id
+                resolved_request = TaskRecommendationRequest(**request_dict)
+            else:
+                logger.info(f"No permit found for address '{resolved_request.address}' in MySQL, proceeding as standalone task")
+        
+        # If we found permit data in MySQL, enhance the request
+        if permit_data:
+            # Use address from MySQL if not provided in request
+            if not resolved_request.address and permit_data.get('address'):
+                request_dict = resolved_request.dict()
+                request_dict['address'] = permit_data['address']
+                resolved_request = TaskRecommendationRequest(**request_dict)
+                logger.info(f"Used address from MySQL: {permit_data['address']}")
+        
         engine = get_recommendation_engine()
         
+        effective_permit_file_id = resolved_request.permit_file_id or resolved_request.file_id
+
         # Prepare additional context
         additional_context = {}
-        if request.file_id:
-            additional_context['file_id'] = request.file_id
-        if request.priority:
-            additional_context['priority'] = request.priority
-        if request.required_skills:
-            additional_context['required_skills'] = request.required_skills
+        if effective_permit_file_id:
+            additional_context['file_id'] = effective_permit_file_id
+        if resolved_request.priority:
+            additional_context['priority'] = resolved_request.priority
+        if resolved_request.required_skills:
+            additional_context['required_skills'] = resolved_request.required_skills
         
-        # Get optimized recommendations with file context
-        # Determine current file stage if file_id is provided
+        # Add MySQL permit data to context if available
+        if permit_data:
+            additional_context['mysql_permit_data'] = permit_data
+        
+        # Determine current file stage if permit_file_id is provided
         current_file_stage = None
-        if request.file_id:
+        resolved_team_lead_code = resolved_request.team_lead_code
+        resolved_team_lead_name = None
+        resolved_zip = None
+        location_source = None
+        
+        # Handle address input - use real ZIP range mapping from zip_assign.py for manual assignment
+        logger.info(f"[DEBUG] Address from request: {resolved_request.address}")
+        logger.info(f"[DEBUG] Effective permit file ID: {effective_permit_file_id}")
+        
+        # Process address for team lead selection if address is provided (regardless of file_id)
+        if resolved_request.address:
+            logger.info(f"[RECOMMEND-ADDRESS] Processing address for team lead selection: {resolved_request.address}")
+            # Validate and extract postal code from address
+            address_info = validate_and_extract_address_info(resolved_request.address)
+            logger.info(f"[RECOMMEND-ADDRESS-VALIDATION] Address validation result: valid={address_info['is_valid']}, zip={address_info.get('zip_code')}")
+            
+            if address_info["is_valid"] and address_info["zip_code"]:
+                postal_code = address_info["zip_code"]
+                logger.info(f"[RECOMMEND-ZIP] Extracted ZIP: {postal_code} from address")
+                
+                # Log any warnings
+                for warning in address_info.get("warnings", []):
+                    logger.warning(f"[ADDRESS] {warning}")
+                
+                # Use real ZIP range and team lead mapping from zip_assign.py
+                try:
+                    from app.api.v1.routers.zip_assign import US_STATE_ZIP_RANGES, TEAM_LEAD_STATE_MAP, _extract_team_lead_code
+                    
+                    # Find which state this postal code belongs to
+                    found_state = None
+                    for state_name, state_info in US_STATE_ZIP_RANGES.items():
+                        zip_min = int(state_info["zip_min"])
+                        zip_max = int(state_info["zip_max"])
+                        if zip_min <= int(postal_code) <= zip_max:
+                            found_state = state_info["code"]
+                            logger.info(f"[RECOMMEND-STATE] ZIP {postal_code} → State: {state_name} ({found_state})")
+                            break
+                    
+                    if found_state and found_state in TEAM_LEAD_STATE_MAP:
+                        # Get team leads for this state
+                        team_leads = TEAM_LEAD_STATE_MAP[found_state]
+                        if team_leads:
+                            # Use the first team lead (you could implement round-robin or load balancing)
+                            selected_team_lead = team_leads[0]
+                            resolved_team_lead_code = _extract_team_lead_code(selected_team_lead)
+                            resolved_team_lead_name = selected_team_lead
+                            location_source = "address_zip_range_mapping"
+                            logger.info(f"[RECOMMEND-TEAMLEAD] State {found_state} → Team Lead: {selected_team_lead} (code: {resolved_team_lead_code})")
+                        else:
+                            logger.warning(f"No team leads found for state: {found_state}")
+                            # Use default team lead
+                            resolved_team_lead_code = "0083"  # Shivam Kumar from your mapping
+                            resolved_team_lead_name = "Shivam Kumar (0083)"
+                            location_source = "default_team_lead"
+                    else:
+                        logger.warning(f"No state mapping found for postal code: {postal_code}")
+                        # Use default team lead if no mapping found
+                        resolved_team_lead_code = "0083"  # Shivam Kumar from your mapping
+                        resolved_team_lead_name = "Shivam Kumar (0083)"
+                        location_source = "default_team_lead"
+                        
+                except ImportError as e:
+                    logger.error(f"Could not import ZIP mapping: {e}")
+                    # Fallback to default team lead
+                    resolved_team_lead_code = "0083"
+                    resolved_team_lead_name = "Shivam Kumar (0083)"
+                    location_source = "fallback_team_lead"
+            else:
+                logger.warning(f"No postal code found in address: {resolved_request.address}")
+                # Use default team lead if no postal code found
+                resolved_team_lead_code = "0083"
+                resolved_team_lead_name = "Shivam Kumar (0083)"
+                location_source = "default_team_lead"
+        
+        # Handle permit_file_id (existing logic)
+        elif effective_permit_file_id:
             try:
                 from app.services.stage_tracking_service import get_stage_tracking_service
                 stage_service = get_stage_tracking_service()
-                tracking = stage_service.get_file_tracking(request.file_id)
+                tracking = stage_service.get_file_tracking(effective_permit_file_id)
                 if tracking:
                     current_file_stage = tracking.current_stage.value
             except Exception as e:
-                logger.warning(f"Failed to get file stage for {request.file_id}: {e}")
+                logger.warning(f"Failed to get file stage for {effective_permit_file_id}: {e}")
+            
+            # Get resolved team lead from file if not provided
+            if not resolved_team_lead_code:
+                resolved_team_lead_code = engine._get_team_lead_from_file(effective_permit_file_id)
+                if resolved_team_lead_code:
+                    resolved_team_lead_name = engine._extract_team_lead_code(resolved_team_lead_code)
+                    location_source = "permit_file"
+                    logger.info(f"Resolved team lead from file {effective_permit_file_id}: {resolved_team_lead_code} ({resolved_team_lead_name})")
         
+        logger.info(f"[RECOMMEND-ENGINE] Calling recommendation engine with team_lead={resolved_team_lead_code}, top_k={request.top_k}")
         recommendations = engine.get_recommendations(
-            task_description=request.task_description,
-            top_k=request.top_k,
-            min_score=request.min_similarity,
-            team_lead_code=request.team_lead_code,
-            file_id=request.file_id,
+            task_description=resolved_request.task_description,
+            top_k=resolved_request.top_k,
+            min_score=resolved_request.min_similarity,
+            team_lead_code=resolved_team_lead_code,
+            file_id=effective_permit_file_id,
             current_file_stage=current_file_stage
         )
         
         processing_time = round((time.time() - start_time) * 1000, 2)  # in milliseconds
+        elapsed = time.time() - start_time
+        logger.info(f"[RECOMMEND-SUCCESS] Returning {len(recommendations)} recommendations in {elapsed:.2f}s")
+        
+        # Import the function for response formatting
+        from app.api.v1.routers.permit_files import _extract_team_lead_code
         
         return RecommendationResponse(
             recommendations=recommendations,
             total_found=len(recommendations),
             query_info={
-                "task_description": request.task_description,
-                "top_k": request.top_k,
-                "min_similarity": request.min_similarity,
-                "filter_by_availability": request.filter_by_availability,
-                "team_lead_code": request.team_lead_code,
+                "task_description": resolved_request.task_description,
+                "top_k": resolved_request.top_k,
+                "min_similarity": resolved_request.min_similarity,
+                "filter_by_availability": resolved_request.filter_by_availability,
+                "team_lead_code": _extract_team_lead_code(resolved_team_lead_code) if resolved_team_lead_code else None,
+                "team_lead_name": resolved_team_lead_name,
+                "location_source": location_source,
+                "resolved_zip": resolved_zip,
+                "location_filter_applied": bool(resolved_team_lead_code),
                 "embedding_model": "text-embedding-004 (Vertex AI Gemini)",
                 "processing_time_ms": processing_time,
-                "optimization": "parallel_execution + caching + vectorized_computation"
+                "optimization": "parallel_execution + caching + vectorized_computation",
+                "validation_warnings": validation_result.warnings if validation_result.warnings else [],
+                "mysql_integration": {
+                    "enabled": True,
+                    "mysql_id_used": bool(request.id),
+                    "mysql_permit_fetched": permit_data is not None,
+                    "mysql_creatorparentid": request.creatorparentid
+                }
             }
         )
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating recommendations: {str(e)}")
+        logger.error(f"[RECOMMEND-ERROR] Failed to get recommendations: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/team-lead-stats")
-@cached(ttl_seconds=30, key_prefix="team_lead_stats")
-def get_team_lead_task_stats():
-    """Get task statistics grouped by team leads with actual manager names"""
-    db = get_db()
-    
-    try:
-        # Get all employees with projection for performance
-        from app.services.stage_tracking_service import convert_objectid_to_str
-        employees = list(db.employee.find({}, {
-            "_id": 0,
-            "employee_code": 1,
-            "employee_name": 1,
-            "reporting_manager": 1,
-            "employment.current_role": 1,
-            "employment.reporting_manager": 1
-        }))
-        employees = convert_objectid_to_str(employees)
-        employee_lookup = {emp.get("employee_code"): emp for emp in employees}
-        
-        # Group employees by team lead using reporting_manager field
-        team_groups = {}
-        for emp in employees:
-            manager_code = emp.get("reporting_manager", "").strip()
-            team_lead_name = ""
-            
-            # Find manager name if code exists - try multiple matching strategies
-            if manager_code:
-                # Strategy 1: Extract employee code from parentheses
-                extracted_code = None
-                extracted_name = None
-                if '(' in manager_code and ')' in manager_code:
-                    # Extract code from "Name (1234)" format
-                    import re
-                    match = re.search(r'\(([^)]+)\)', manager_code)
-                    if match:
-                        extracted_code = match.group(1).strip()
-                        # Extract name before parentheses
-                        name_match = re.match(r'([^(]+)', manager_code.strip())
-                        if name_match:
-                            extracted_name = name_match.group(1).strip()
-                
-                # Strategy 2: Try exact match first
-                if manager_code in employee_lookup:
-                    team_lead_name = employee_lookup[manager_code].get("employee_name", f"Team Lead {manager_code}")
-                elif extracted_code and extracted_code in employee_lookup:
-                    team_lead_name = employee_lookup[extracted_code].get("employee_name", f"Team Lead {manager_code}")
-                else:
-                    # Strategy 3: Fallback to extracted name or use original string
-                    if extracted_name:
-                        team_lead_name = extracted_name
-                    else:
-                        team_lead_name = manager_code
-                    
-                    # Optional: Try partial matches as additional attempts
-                    normalized_code = manager_code.replace(" ", "").replace("(", "").replace(")", "")
-                    for emp_code, emp_data in employee_lookup.items():
-                        normalized_emp_code = emp_code.replace(" ", "").replace("(", "").replace(")", "")
-                        if normalized_code == normalized_emp_code:
-                            team_lead_name = emp_data.get("employee_name", f"Team Lead {manager_code}")
-                            break
-                    
-                    if team_lead_name == manager_code:  # Only try name match if still using fallback
-                        for emp_code, emp_data in employee_lookup.items():
-                            emp_name = emp_data.get("employee_name", "").lower()
-                            manager_lower = manager_code.lower()
-                            if emp_name and (emp_name in manager_lower or manager_lower in emp_name):
-                                team_lead_name = emp_data.get("employee_name", f"Team Lead {manager_code}")
-                                break
-            
-            if manager_code not in team_groups:
-                team_groups[manager_code] = {
-                    "team_lead_code": manager_code,
-                    "team_lead_name": team_lead_name,
-                    "employees": {},
-                    "all_tasks": []
-                }
-        
-        # Get all assigned tasks with employee details
-        pipeline = [
-            {
-                "$match": {
-                    "assigned_to": {"$exists": True, "$ne": None}
-                }
-            },
-            {
-                "$lookup": {
-                    "from": "employee",
-                    "localField": "assigned_to",
-                    "foreignField": "employee_code",
-                    "as": "employee_details",
-                    "pipeline": [
-                        {
-                            "$project": {
-                                "employee_code": 1,
-                                "employee_name": 1,
-                                "employment.current_role": 1,
-                                "employment.reporting_manager": 1
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "$unwind": "$employee_details"
-            }
-        ]
-        
-        tasks_with_employees = list(db.tasks.aggregate(pipeline))
-        
-        # Process tasks and group by team lead
-        for task in tasks_with_employees:
-            emp = task["employee_details"]
-            employee_code = emp.get("employee_code", "").strip()
-            
-            # Get the actual manager for this employee from employee_lookup
-            employee_data = employee_lookup.get(employee_code, {})
-            actual_manager_code = employee_data.get("reporting_manager", "").strip()
-            actual_manager_name = ""
-            
-            if actual_manager_code and actual_manager_code in employee_lookup:
-                actual_manager_name = employee_lookup[actual_manager_code].get("employee_name", f"Team Lead {actual_manager_code}")
-            
-            # Initialize team group if not exists
-            if actual_manager_code not in team_groups:
-                team_groups[actual_manager_code] = {
-                    "team_lead_code": actual_manager_code,
-                    "team_lead_name": actual_manager_name,
-                    "employees": {},
-                    "all_tasks": []
-                }
-            
-            # Add employee if not already added (unique by employee_code)
-            if employee_code not in team_groups[actual_manager_code]["employees"]:
-                team_groups[actual_manager_code]["employees"][employee_code] = {
-                    "employee_code": emp["employee_code"],
-                    "employee_name": emp["employee_name"],
-                    "employee_role": emp.get("employment", {}).get("current_role", "Not specified"),
-                    "task_count": 0,
-                    "tasks": []
-                }
-            
-            # Add task to employee and team
-            task_data = {
-                "task_id": task.get("task_id"),
-                "task_title": task.get("task_description", task.get("task_title", "Untitled Task")),
-                "status": task.get("status", "UNKNOWN"),
-                "assigned_at": task.get("assigned_at"),
-                "completed_at": task.get("completed_at")
-            }
-            
-            team_groups[actual_manager_code]["employees"][employee_code]["tasks"].append(task_data)
-            team_groups[actual_manager_code]["employees"][employee_code]["task_count"] += 1
-            team_groups[actual_manager_code]["all_tasks"].append(task_data)
-        
-        # Calculate statistics for each team
-        team_stats = []
-        for team_code, team_data in team_groups.items():
-            employees_dict = team_data["employees"]
-            all_tasks = team_data["all_tasks"]
-            
-            # Create flattened list for display (grouped by employee)
-            employees_list = []
-            for emp_code, emp_data in employees_dict.items():
-                # Add employee entry with task count
-                employees_list.append({
-                    "employee_code": emp_data["employee_code"],
-                    "employee_name": emp_data["employee_name"],
-                    "employee_role": emp_data["employee_role"],
-                    "task_count": emp_data["task_count"],
-                    "tasks": emp_data["tasks"]  # Keep tasks for detailed view
-                })
-            
-            # Sort employees by task count (ascending) for better assignment decisions
-            employees_list.sort(key=lambda x: x["task_count"])
-            
-            # Calculate statistics based on all tasks
-            total_tasks = len(all_tasks)
-            completed_tasks = len([t for t in all_tasks if t["status"] == "COMPLETED"])
-            in_progress_tasks = len([t for t in all_tasks if t["status"] == "IN_PROGRESS"])
-            assigned_tasks = len([t for t in all_tasks if t["status"] == "ASSIGNED"])
-            completion_rate = round((completed_tasks / total_tasks * 100) if total_tasks > 0 else 0, 1)
-            
-            team_stats.append({
-                "team_lead_code": team_code,
-                "team_lead_name": team_data["team_lead_name"],
-                "employees": employees_list,  # Grouped by employee with task counts
-                "unique_employees": len(employees_dict),
-                "total_tasks": total_tasks,
-                "completed_tasks": completed_tasks,
-                "in_progress_tasks": in_progress_tasks,
-                "assigned_tasks": assigned_tasks,
-                "completion_rate": completion_rate,
-                "status": "ACTIVE" if total_tasks > 0 else "IDLE"
-            })
-        
-        return {
-            "team_stats": team_stats,
-            "total_teams": len(team_stats),
-            "last_updated": datetime.utcnow().isoformat() + 'Z'
-        }
-    
-    except Exception as e:
-        logger.error(f"Error in get_team_lead_task_stats: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching team lead stats: {str(e)}")
-
-@router.get("/permit-file-tracking")
-def get_permit_file_tracking():
-    """Track progress of permit files and assigned employees"""
-    db = get_db()
-    
-    try:
-        # Aggregate tasks by permit file
-        pipeline = [
-            {
-                "$match": {
-                    "source.permit_file_id": {"$exists": True, "$ne": None}
-                }
-            },
-            {
-                "$lookup": {
-                    "from": "employee",
-                    "localField": "assigned_to",
-                    "foreignField": "employee_code",
-                    "as": "employee_details",
-                    "pipeline": [
-                        {
-                            "$project": {
-                                "employee_code": 1,
-                                "employee_name": 1,
-                                "employment.current_role": 1,
-                                "employment.reporting_manager": 1
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "$unwind": "$employee_details"
-            },
-            {
-                "$group": {
-                    "_id": "$source.permit_file_id",
-                    "permit_file_id": {"$first": "$source.permit_file_id"},
-                    "tasks": {
-                        "$push": {
-                            "task_id": "$task_id",
-                            "task_title": {"$ifNull": ["$title", "$task_assigned", "$task_description"]},
-                            "status": "$status",
-                            "assigned_to": "$assigned_to",
-                            "employee_name": "$employee_details.employee_name",
-                            "employee_role": "$employee_details.employment.current_role",
-                            "team_lead": "$employee_details.employment.reporting_manager.employee_name",
-                            "assigned_at": "$assigned_at",
-                            "completed_at": "$completed_at"
-                        }
-                    }
-                }
-            },
-            {
-                "$project": {
-                    "_id": 0,
-                    "permit_file_id": 1,
-                    "tasks": 1,
-                    "total_tasks": {"$size": "$tasks"},
-                    "completed_tasks": {
-                        "$size": {
-                            "$filter": {
-                                "input": "$tasks",
-                                "cond": {"$in": ["$$this.status", ["COMPLETED", "DONE"]]}
-                            }
-                        }
-                    },
-                    "in_progress_tasks": {
-                        "$size": {
-                            "$filter": {
-                                "input": "$tasks",
-                                "cond": {"$eq": ["$$this.status", "IN_PROGRESS"]}
-                            }
-                        }
-                    },
-                    "assigned_tasks": {
-                        "$size": {
-                            "$filter": {
-                                "input": "$tasks",
-                                "cond": {"$eq": ["$$this.status", "ASSIGNED"]}
-                            }
-                        }
-                    }
-                }
-            },
-            {
-                "$addFields": {
-                    "completion_rate": {
-                        "$round": [
-                            {
-                                "$multiply": [
-                                    {
-                                        "$divide": ["$completed_tasks", "$total_tasks"]
-                                    },
-                                    100
-                                ]
-                            },
-                            1
-                        ]
-                    },
-                    "status": {
-                        "$switch": {
-                            "branches": [
-                                {"case": {"$eq": ["$completed_tasks", "$total_tasks"]}, "then": "COMPLETED"},
-                                {"case": {"$gt": ["$in_progress_tasks", 0]}, "then": "IN_PROGRESS"},
-                                {"case": {"$gt": ["$assigned_tasks", 0]}, "then": "ASSIGNED"}
-                            ],
-                            "default": "PENDING"
-                        }
-                    }
-                }
-            }
-        ]
-        
-        # Add final projection to exclude _id
-        pipeline.append({
-            "$project": {
-                "_id": 0,
-                "permit_file_id": 1,
-                "tasks": 1,
-                "total_tasks": 1,
-                "completed_tasks": 1,
-                "in_progress_tasks": 1,
-                "assigned_tasks": 1,
-                "completion_rate": 1,
-                "status": 1
-            }
-        })
-        
-        permit_files = list(db.tasks.aggregate(pipeline))
-
-        # Attach original filename to each permit file entry (so UI can show real name)
-        file_ids = [pf.get("permit_file_id") for pf in permit_files if pf.get("permit_file_id")]
-        name_map = {}
-        if file_ids:
-            for pf_doc in db.permit_files.find(
-                {"file_id": {"$in": file_ids}},
-                {"_id": 0, "file_id": 1, "file_info.original_filename": 1, "file_name": 1},
-            ):
-                fid = pf_doc.get("file_id")
-                if fid:
-                    name_map[fid] = (
-                        pf_doc.get("file_info", {}).get("original_filename")
-                        or pf_doc.get("file_name")
-                        or fid
-                    )
-        
-        # Format dates
-        for permit_file in permit_files:
-            permit_id = permit_file.get("permit_file_id")
-            if permit_id:
-                permit_file["file_name"] = name_map.get(permit_id, permit_id)
-            for task in permit_file["tasks"]:
-                if task.get("assigned_at") and isinstance(task["assigned_at"], datetime):
-                    task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
-                if task.get("completed_at") and isinstance(task["completed_at"], datetime):
-                    task["completed_at"] = task["completed_at"].isoformat() + 'Z'
-        
-        return {
-            "data": permit_files,
-            "total_permit_files": len(permit_files),
-            "last_updated": datetime.utcnow().isoformat() + 'Z'
-        }
-    
-    except Exception as e:
-        logger.error(f"Error in get_permit_file_tracking: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching permit file tracking: {str(e)}")
-
-@router.get("/recent-activity")
-async def get_recent_activity():
-    """Get recent task activity across all employees"""
-    db = get_db()
-    
-    try:
-        # Get recent tasks with employee details, sorted by most recent activity
-        pipeline = [
-            {
-                "$match": {
-                    "$or": [
-                        {"assigned_at": {"$exists": True}},
-                        {"completed_at": {"$exists": True}}
-                    ]
-                }
-            },
-            {
-                "$lookup": {
-                    "from": "employee",
-                    "localField": "assigned_to",
-                    "foreignField": "employee_code",
-                    "as": "employee_details",
-                    "pipeline": [
-                        {
-                            "$project": {
-                                "employee_code": 1,
-                                "employee_name": 1,
-                                "employment.current_role": 1,
-                                "employment.reporting_manager": 1
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "$unwind": "$employee_details"
-            },
-            {
-                "$addFields": {
-                    "latest_activity": {
-                        "$cond": {
-                            "if": {"$gt": [{"$ifNull": ["$completed_at", None]}, {"$ifNull": ["$assigned_at", None]}]},
-                            "then": "$completed_at",
-                            "else": "$assigned_at"
-                        }
-                    }
-                }
-            },
-            {"$sort": {"latest_activity": -1}},
-            {"$limit": 20},
-            {
-                "$project": {
-                    "_id": 0,
-                    "task_id": 1,
-                    "title": 1,
-                    "task_description": 1,
-                    "status": 1,
-                    "assigned_to": 1,
-                    "assigned_at": 1,
-                    "completed_at": 1,
-                    "employee_details": 1,
-                    "latest_activity": 1
-                }
-            }
-        ]
-        
-        recent_tasks = list(db.tasks.aggregate(pipeline))
-        
-        # Process activities
-        activities = []
-        for task in recent_tasks:
-            emp = task["employee_details"]
-            team_lead_info = emp.get("employment", {}).get("reporting_manager", {})
-            
-            # Determine activity type and timestamp
-            if task.get("completed_at") and task.get("assigned_at"):
-                if task["completed_at"] > task["assigned_at"]:
-                    activity_type = "completed"
-                    activity_time = task["completed_at"]
-                    description = f"completed task '{task.get('title') or task.get('task_assigned', 'Untitled')}'"
-                else:
-                    activity_type = "assigned"
-                    activity_time = task["assigned_at"]
-                    description = f"was assigned task '{task.get('title') or task.get('task_assigned', 'Untitled')}'"
-            elif task.get("completed_at"):
-                activity_type = "completed"
-                activity_time = task["completed_at"]
-                description = f"completed task '{task.get('title') or task.get('task_assigned', 'Untitled')}'"
-            elif task.get("assigned_at"):
-                activity_type = "assigned"
-                activity_time = task["assigned_at"]
-                description = f"was assigned task '{task.get('title') or task.get('task_assigned', 'Untitled')}'"
-            else:
-                continue
-            
-            # Format dates
-            if isinstance(activity_time, datetime):
-                activity_time = activity_time.isoformat() + 'Z'
-            
-            activities.append({
-                "activity_id": f"{task['task_id']}-{activity_type}",
-                "activity_type": activity_type,
-                "employee_code": emp["employee_code"],
-                "employee_name": emp["employee_name"],
-                "employee_role": emp.get("employment", {}).get("current_role", "Not specified"),
-                "team_lead": team_lead_info.get("name", "Unassigned"),
-                "task_id": task["task_id"],
-                "task_title": task.get("title") or task.get("task_assigned", "Untitled"),
-                "description": description,
-                "activity_time": activity_time,
-                "status": task.get("status", "UNKNOWN")
-            })
-        
-        return {
-            "activities": activities,
-            "total_activities": len(activities),
-            "last_updated": datetime.utcnow().isoformat() + 'Z'
-        }
-    
-    except Exception as e:
-        print(f"Error in get_recent_activity: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching recent activity: {str(e)}")
-
-@router.get("/completed-today")
-async def get_completed_today():
-    """Get tasks completed today"""
-    db = get_db()
-    
-    # Get today's date in UTC
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    try:
-        tomorrow = today + timedelta(days=1)
-        today_prefix = today.strftime("%Y-%m-%d")
-
-        # Find tasks completed today.
-        # completed_at can be stored either as a datetime or as an ISO string.
-        completed_tasks = list(db.tasks.find({
-            "status": "COMPLETED",
-            "$or": [
-                {"completed_at": {"$gte": today, "$lt": tomorrow}},
-                {"completed_at": {"$regex": f"^{today_prefix}"}}
-            ]
-        }, {"_id": 0}))
-
-        def to_iso(value: Any) -> Optional[str]:
-            if value is None:
-                return None
-            if isinstance(value, datetime):
-                return value.isoformat() + 'Z'
-            if isinstance(value, str):
-                return value
-            return str(value)
-        
-        # Get employee details for completed tasks
-        result = []
-        for task in completed_tasks:
-            # Find employee details
-            employee = db.employee.find_one({"employee_code": task.get("assigned_to")})
-            team_lead_info = employee.get("employment", {}).get("reporting_manager", {}) if employee else {}
-            
-            completed_task = {
-                "task_id": task["task_id"],
-                "task_title": task.get("title") or task.get("task_assigned", "Untitled"),
-                "employee_code": task.get("assigned_to", ""),
-                "employee_name": employee.get("employee_name", "Unknown") if employee else "Unknown",
-                "employee_role": employee.get("employment", {}).get("current_role", "Not specified") if employee else "Not specified",
-                "team_lead": team_lead_info.get("name", "Unassigned"),
-                "completed_at": to_iso(task.get("completed_at")),
-                "assigned_at": to_iso(task.get("assigned_at"))
-            }
-            result.append(completed_task)
-        
-        return {
-            "completed_today": result,
-            "total_completed": len(result),
-            "date": today.isoformat() + 'Z',
-            "last_updated": datetime.utcnow().isoformat() + 'Z'
-        }
-    
-    except Exception as e:
-        print(f"Error in get_completed_today: {e}")
-        import traceback
-        traceback.print_exc()
-        # Return empty result instead of error
-        return {
-            "completed_today": [],
-            "total_completed": 0,
-            "date": today.strftime("%Y-%m-%d"),
-            "last_updated": datetime.utcnow().isoformat() + 'Z',
-            "error": str(e)
-        }
-
-@router.get("/ready-for-assignment")
-async def get_files_ready_for_assignment(stage: Optional[str] = Query(None)):
-    """Get files that are ready for assignment based on stage progression"""
-    db = get_db()
-    
-    try:
-        from app.models.stage_flow import FileStage
-        
-        stage_service = get_stage_tracking_service()
-        
-        # If no stage specified, get files ready for PRELIMS (new files)
-        if not stage:
-            stage = FileStage.PRELIMS
-        
-        # Validate stage
-        try:
-            target_stage = FileStage(stage.upper())
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid stage: {stage}")
-        
-        # Get files ready for the specified stage
-        ready_files = stage_service.get_files_ready_for_stage(target_stage)
-        
-        return {
-            "success": True,
-            "stage": target_stage.value,
-            "files": ready_files,
-            "total": len(ready_files),
-            "message": f"Found {len(ready_files)} files ready for {target_stage.value} stage"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting ready files: {str(e)}")
-
-@router.get("/assigned")
-async def get_all_assigned_tasks():
-    """Get all assigned tasks with employee details - OPTIMIZED for task board"""
-    db = get_db()
-    
-    try:
-        # Simple query first to avoid aggregation issues
-        tasks = list(db.tasks.find(
-            {
-                "assigned_to": {"$exists": True, "$ne": None},
-                "status": {"$in": ["ASSIGNED", "IN_PROGRESS"]}
-            },
-            {
-                "_id": 0,
-                "task_id": 1,
-                "title": 1,
-                "task_description": 1,
-                "task_assigned": 1,
-                "status": 1,
-                "assigned_at": 1,
-                "time_assigned": 1,
-                "date_assigned": 1,
-                "assigned_by": 1,
-                "assigned_to": 1,
-                "assigned_to_name": 1,
-                "completed_at": 1
-            }
-        ))
-        
-        # Get unique employee codes
-        employee_codes = list(set(task.get("assigned_to") for task in tasks if task.get("assigned_to")))
-        
-        # Fetch employee details in batch
-        employees = {}
-        if employee_codes:
-            employee_docs = list(db.employee.find(
-                {"employee_code": {"$in": employee_codes}},
-                {
-                    "employee_code": 1,
-                    "employee_name": 1,
-                    "employment.current_role": 1,
-                    "employment.shift": 1,
-                    "employment.status_1": 1,
-                    "_id": 0
-                }
-            ))
-            employees = {emp["employee_code"]: emp for emp in employee_docs}
-        
-        # Combine task and employee data
-        for task in tasks:
-            emp_code = task.get("assigned_to")
-            if emp_code and emp_code in employees:
-                task["employee_details"] = employees[emp_code]
-            
-            # Format dates
-            if task.get("assigned_at") and isinstance(task["assigned_at"], datetime):
-                task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
-            if task.get("completed_at") and isinstance(task["completed_at"], datetime):
-                task["completed_at"] = task["completed_at"].isoformat() + 'Z'
-        
-        return {
-            "tasks": tasks,
-            "total": len(tasks),
-            "last_updated": datetime.utcnow().isoformat() + 'Z'
-        }
-    
-    except Exception as e:
-        print(f"Error in get_all_assigned_tasks: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching assigned tasks: {str(e)}")
-
-@router.get("/employee/{employee_code}/assigned") 
-async def get_employee_assigned_tasks(employee_code: str):
-    """Get assigned tasks for a specific employee - for incremental updates"""
-    db = get_db()
-    
-    # Get employee details and tasks in one query
-    employee = db.employee.find_one(
-        {"employee_code": employee_code},
-        {
-            "employee_code": 1,
-            "employee_name": 1,
-            "employment.current_role": 1,
-            "employment.shift": 1,
-            "employment.status_1": 1,
-            "_id": 0
-        }
-    )
-    
-    if not employee:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    
-    # Get assigned tasks for this employee
-    tasks = list(db.tasks.find(
-        {
-            "assigned_to": employee_code,
-            "status": {"$in": ["ASSIGNED", "IN_PROGRESS"]}
-        },
-        {
-            "_id": 0,
-            "task_id": 1,
-            "title": 1,
-            "task_description": 1,
-            "task_assigned": 1,
-            "status": 1,
-            "assigned_at": 1,
-            "time_assigned": 1,
-            "date_assigned": 1,
-            "assigned_by": 1,
-            "completed_at": 1
-        }
-    ))
-    
-    # Format dates
-    for task in tasks:
-        if task.get("assigned_at") and isinstance(task["assigned_at"], datetime):
-            task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
-        if task.get("completed_at") and isinstance(task["completed_at"], datetime):
-            task["completed_at"] = task["completed_at"].isoformat() + 'Z'
-    
-    return {
-        "employee": employee,
-        "tasks": tasks,
-        "total": len(tasks)
-    }
-
-@router.get("/employee/{employee_code}/completed")
-async def get_employee_completed_tasks(employee_code: str):
-    """Get completed tasks for a specific employee"""
-    db = get_db()
-    
-    # Verify employee exists
-    employee = db.employee.find_one({"employee_code": employee_code})
-    if not employee:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    
-    # Get completed tasks for this employee
-    tasks = list(db.tasks.find(
-        {
-            "assigned_to": employee_code,
-            "status": "COMPLETED"
-        },
-        {
-            "_id": 0,
-            "task_id": 1,
-            "title": 1,
-            "description": 1,
-            "assigned_at": 1,
-            "completed_at": 1,
-            "status": 1,
-            "skills_required": 1,
-            "source": 1
-        }
-    ).sort("completed_at", -1))  # Sort by completion date, most recent first
-    
-    # Format dates to include timezone info
-    for task in tasks:
-        if task.get("assigned_at") and isinstance(task["assigned_at"], datetime):
-            task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
-        if task.get("completed_at") and isinstance(task["completed_at"], datetime):
-            task["completed_at"] = task["completed_at"].isoformat() + 'Z'
-    
-    return {
-        "tasks": tasks,
-        "total": len(tasks)
-    }
-
-@router.get("/")
-async def get_all_tasks():
-    """Get all tasks"""
-    db = get_db()
-    tasks = list(db.tasks.find({}, {"_id": 0, "embeddings.description_embedding": 0}))
-    
-    # Format dates to include timezone info
-    for task in tasks:
-        if task.get("assigned_at") and isinstance(task["assigned_at"], datetime):
-            task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
-        if task.get("completed_at") and isinstance(task["completed_at"], datetime):
-            task["completed_at"] = task["completed_at"].isoformat() + 'Z'
-        if task.get("metadata", {}).get("updated_at") and isinstance(task["metadata"]["updated_at"], datetime):
-            task["metadata"]["updated_at"] = task["metadata"]["updated_at"].isoformat() + 'Z'
-    
-    return tasks
-
-@router.get("/{task_id}")
-async def get_task(task_id: str):
-    """Get a specific task"""
-    db = get_db()
-    task = db.tasks.find_one({"task_id": task_id}, {"_id": 0, "embeddings.description_embedding": 0})
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Format dates to include timezone info
-    if task.get("assigned_at") and isinstance(task["assigned_at"], datetime):
-        task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
-    if task.get("completed_at") and isinstance(task["completed_at"], datetime):
-        task["completed_at"] = task["completed_at"].isoformat() + 'Z'
-    if task.get("metadata", {}).get("updated_at") and isinstance(task["metadata"]["updated_at"], datetime):
-        task["metadata"]["updated_at"] = task["metadata"]["updated_at"].isoformat() + 'Z'
-    
-    return task
 
 @router.post("/{task_id}/assign")
 async def assign_task(task_id: str, assignment: TaskAssign):
-    """Assign task to employee and update profile_building"""
+    """Assign task to employee and update profile_building (MySQL backward compatible)"""
+    # Apply MySQL to MongoDB field mapping
+    resolved_assignment = resolve_mysql_to_mongodb_fields_for_task_assign(assignment)
+    
     db = get_db()
     
-    # Get task
-    task = db.tasks.find_one({"task_id": task_id})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Get employee
-    employee = db.employee.find_one({"employee_code": assignment.employee_code})
-    if not employee:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
-    # Create or update file tracking for ALL tasks to ensure dashboard visibility
-    stage_service = get_stage_tracking_service()
-    
-    # Determine file_id and stage
-    file_id = task.get("source", {}).get("permit_file_id")
-    if not file_id:
-        # Create virtual file ID for standalone tasks
-        file_id = f"TASK-{task_id}"
-    
-    task_stage_raw = task.get("stage") or "PRELIMS"
     try:
-        task_stage = FileStage(task_stage_raw)
-    except Exception:
-        task_stage = FileStage.PRELIMS
-
-    # Ensure file tracking exists
-    tracking_doc = stage_service.get_file_tracking(file_id)
-    if not tracking_doc:
-        stage_service.initialize_file_tracking(file_id, task_stage)
-        tracking_doc = stage_service.get_file_tracking(file_id)
+        # Get the task to check its file_id before assigning
+        task_to_assign = db.tasks.find_one({"task_id": task_id}, {"file_id": 1, "title": 1, "stage": 1})
+        if not task_to_assign:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
-        # Link task to file tracking in metadata
-        db.file_tracking.update_one(
-            {"file_id": file_id},
-            {"$set": {"linked_task_id": task_id, "task_type": "standalone_task"}}
+        file_id = task_to_assign.get("file_id")
+        duplicate_warning = None
+        
+        # Check for duplicate: same file_id already has an active task assigned
+        if file_id:
+            existing_active = list(db.tasks.find(
+                {
+                    "file_id": file_id,
+                    "task_id": {"$ne": task_id},
+                    "status": {"$in": ["ASSIGNED", "IN_PROGRESS"]},
+                    "assigned_to": {"$ne": None}
+                },
+                {"task_id": 1, "title": 1, "assigned_to": 1, "assigned_to_name": 1, "stage": 1, "status": 1}
+            ))
+            if existing_active:
+                for dup in existing_active:
+                    logger.warning(
+                        f"[DUPLICATE-ASSIGN-WARNING] File {file_id} already has active task "
+                        f"{dup.get('task_id')} (stage={dup.get('stage')}) assigned to "
+                        f"{dup.get('assigned_to_name','?')} ({dup.get('assigned_to')})"
+                    )
+                dup_info = [
+                    f"task_id={d.get('task_id')} stage={d.get('stage')} assigned_to={d.get('assigned_to_name','?')} ({d.get('assigned_to')}) status={d.get('status')}"
+                    for d in existing_active
+                ]
+                duplicate_warning = f"File {file_id} already has {len(existing_active)} active task(s): {'; '.join(dup_info)}"
+        
+        # Fetch employee name for assigned_to_name and ClickHouse
+        employee_doc = db.employee.find_one(
+            {"$or": [
+                {"employee_code": resolved_assignment.employee_code},
+                {"kekaemployeenumber": resolved_assignment.employee_code}
+            ]},
+            {"_id": 0, "employee_name": 1, "reporting_manager": 1, "team_lead": 1}
         )
-    
-    # Validate stage prerequisites if file_id exists
-    if task.get("source", {}).get("permit_file_id"):
-        # First reconcile based on already completed tasks
-        try:
-            stage_service.auto_progress_from_tasks(file_id)
-        except Exception:
-            pass
-
-        tracking_doc = stage_service.get_file_tracking(file_id)
-        tracking = _parse_file_tracking_safely(tracking_doc) if isinstance(tracking_doc, dict) else tracking_doc
-
-        if tracking:
-            if task_stage == FileStage.PRODUCTION:
-                if tracking.current_stage == FileStage.PRELIMS:
-                    # Check if PRELIMS is completed (all tasks done)
-                    prelims_tasks = db.tasks.count_documents({
-                        "source.permit_file_id": file_id,
-                        "stage": "PRELIMS",
-                        "status": {"$nin": ["COMPLETED", "DONE"]}
-                    })
-                    
-                    if prelims_tasks == 0:
-                        # PRELIMS is completed, auto-progress to PRODUCTION
-                        stage_service.auto_progress_from_tasks(file_id)
-                        tracking_doc = stage_service.get_file_tracking(file_id)
-                        tracking = _parse_file_tracking_safely(tracking_doc) if isinstance(tracking_doc, dict) else tracking_doc
-                    else:
-                        # PRELIMS still has incomplete tasks, don't allow PRODUCTION yet
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"File must complete PRELIMS stage before assigning PRODUCTION tasks. {prelims_tasks} PRELIMS tasks still incomplete.",
-                        )
-
-                if not tracking or tracking.current_stage != FileStage.PRODUCTION:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="File must be in PRODUCTION stage to assign PRODUCTION tasks",
-                    )
-
-            if task_stage == FileStage.QC:
-                # QC tasks only after production completion (COMPLETED)
-                if tracking.current_stage != FileStage.QC:
-                    if tracking.current_stage == FileStage.COMPLETED:
-                        # Production is completed, move to QC
-                        stage_service.transition_to_next_stage(file_id, assignment.employee_code, FileStage.QC)
-                        tracking_doc = stage_service.get_file_tracking(file_id)
-                        tracking = _parse_file_tracking_safely(tracking_doc) if isinstance(tracking_doc, dict) else tracking_doc
-                    else:
-                        # Production not completed yet, don't allow QC
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"File must complete PRODUCTION stage before assigning QC tasks. Current stage: {tracking.current_stage}",
-                        )
-
-                if not tracking or tracking.current_stage != FileStage.QC:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="File must be in QC stage to assign QC tasks",
-                    )
-    
-    assigned_time = datetime.utcnow()
-    
-    # Update task status
-    db.tasks.update_one(
-        {"task_id": task_id},
-        {
-            "$set": {
-                "assigned_to": assignment.employee_code,
-                "assigned_to_name": employee["employee_name"],
-                "assigned_by": assignment.assigned_by,
-                "assigned_at": assigned_time,
-                "status": "ASSIGNED",
-                "metadata.updated_at": assigned_time
-            }
+        employee_name = employee_doc.get("employee_name", "Unknown") if employee_doc else "Unknown"
+        
+        # Determine team lead from employee document
+        team_lead = None
+        if employee_doc:
+            team_lead = employee_doc.get("team_lead") or employee_doc.get("reporting_manager")
+        
+        # Update task with assignment details
+        update_data = {
+            "assigned_to": resolved_assignment.employee_code,
+            "assigned_to_name": employee_name,
+            "employee_code": resolved_assignment.employee_code,  # Keep for backward compatibility
+            "assigned_by": resolved_assignment.assigned_by,
+            "assigned_at": datetime.now(timezone.utc),
+            "status": "ASSIGNED",
+            "metadata.updated_at": datetime.now(timezone.utc)
         }
-    )
-    
-    # Add to profile_building collection (minimal fields as per requirement)
-    profile_entry = {
-        "employee_code": assignment.employee_code,
-        "employee_name": employee["employee_name"],
-        "task_id": task_id,
-        "task_assigned": task["description"],
-        "date_assigned": assigned_time.date().isoformat(),  # Convert to string
-        "time_assigned": assigned_time,
-        "completion_time": None,
-        "hours_taken": None,
-        "status": "ASSIGNED",
-        "permit_file_id": task.get("source", {}).get("permit_file_id"),
-        "assigned_by": assignment.assigned_by,
-        "created_at": assigned_time,
-        "updated_at": assigned_time
-    }
-    
-    db.profile_building.insert_one(profile_entry)
-    
-    # Write to task_file_map fact table if SLA-applicable
-    file_id = task.get("source", {}).get("permit_file_id")
-    if file_id and file_id.strip():
+        
+        result = db.tasks.update_one(
+            {"task_id": task_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+            
+        # Update permit_files with acceptance and lead data
+        if file_id:
+            db.permit_files.update_one(
+                {"file_id": file_id},
+                {
+                    "$set": {
+                        "acceptance.accepted_by": employee_name,
+                        "acceptance.accepted_at": datetime.now(timezone.utc),
+                        "assigned_to_lead": team_lead
+                    }
+                }
+            )
+        
+        # Get task details for profile_building
+        task = db.tasks.find_one({"task_id": task_id})
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        
+        # Add to profile_building collection for employee dashboard
+        profile_entry = {
+            "employee_code": resolved_assignment.employee_code,
+            "task_id": task_id,
+            "title": task.get("title", ""),
+            "description": task.get("description", ""),
+            "assigned_by": resolved_assignment.assigned_by,
+            "assigned_at": datetime.now(timezone.utc),
+            "status": "ASSIGNED",
+            "due_date": task.get("due_date"),
+            "estimated_hours": task.get("estimated_hours"),
+            "file_id": task.get("file_id"),
+            "stage": task.get("stage"),
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc)
+        }
+        
+        db.profile_building.insert_one(profile_entry)
+        
+        # Register employee with stage tracking so task completion triggers stage progression
+        file_id = task.get("file_id")
+        task_stage = task.get("stage")
+        if file_id and task_stage:
+            try:
+                from app.services.stage_tracking_service import get_stage_tracking_service
+                from app.models.stage_flow import FileStage
+                stage_service = get_stage_tracking_service()
+                
+                # Initialize file tracking if it doesn't exist
+                existing_tracking = stage_service.get_file_tracking(file_id)
+                if not existing_tracking:
+                    try:
+                        stage_val = FileStage(task_stage)
+                    except Exception:
+                        stage_val = FileStage.PRELIMS
+                    stage_service.initialize_file_tracking(file_id, stage_val)
+                    logger.info(f"[STAGE-TRACKING] Initialized tracking for file {file_id} at stage {stage_val}")
+                
+                # Ensure tracking status is IN_PROGRESS so assign_employee_to_stage accepts it
+                # (initialize_file_tracking sets PENDING; we move it to IN_PROGRESS on first assignment)
+                from app.models.file_stage_tracking import FILE_TRACKING_COLLECTION
+                db.file_tracking.update_one(
+                    {"file_id": file_id, "current_status": {"$in": ["PENDING", "NOT_STARTED"]}},
+                    {"$set": {"current_status": "IN_PROGRESS"}}
+                )
+                
+                # Register employee as current assignee for this stage
+                stage_service.assign_employee_to_stage(
+                    file_id,
+                    resolved_assignment.employee_code,
+                    employee_name,
+                    notes=f"Assigned via task {task_id}"
+                )
+                logger.info(f"[STAGE-TRACKING] Registered {resolved_assignment.employee_code} for file {file_id} stage {task_stage}")
+            except Exception as st_err:
+                logger.warning(f"[STAGE-TRACKING-WARN] Could not register employee with stage tracking: {st_err}")
+        
+        # Emit ClickHouse event if enabled
         try:
             from app.services.clickhouse_service import clickhouse_service
-            clickhouse_service.client.execute(
-                'INSERT INTO task_file_map (task_id, file_id, employee_id, employee_name, assigned_at, task_status, stage) VALUES',
-                [(task_id, file_id, assignment.employee_code, employee["employee_name"], 
-                  assigned_time, 'ASSIGNED', task.get('stage', 'UNASSIGNED'))]
-            )
-            logger.info(f"Inserted task_file_map record for {task_id}")
-            
-            # Update file_lifecycle.current_stage for real-time tracking
-            # (safe because prerequisite validation already passed above)
-            task_stage = task.get('stage', 'PRELIMS')
-            clickhouse_service.update_file_stage(file_id, task_stage)
-            logger.info(f"Updated file_lifecycle stage for {file_id} to {task_stage}")
-            
+            if clickhouse_service.client:
+                # Call async method synchronously using the event loop or create a background task
+                loop = asyncio.get_event_loop()
+                loop.create_task(clickhouse_service.emit_task_assigned_event(
+                    task_id=task_id,
+                    employee_code=resolved_assignment.employee_code,
+                    employee_name=employee_name,
+                    assigned_by=resolved_assignment.assigned_by,
+                    file_id_param=task.get("file_id"),
+                    tracking_mode=task.get("tracking_mode")
+                ))
+                logger.info(f"[CLICKHOUSE-EVENT-TASK] Emitting task_assigned event for {task_id}")
         except Exception as e:
-            logger.error(f"Failed to insert task_file_map or update file_lifecycle: {e}")
-    
-    # Create or update stage tracking based on assigned task stage (best-effort)
-    if file_id:
-        try:
-            stage_service = get_stage_tracking_service()
-            task_stage_raw = task.get("stage") or "PRELIMS"
-            try:
-                task_stage = FileStage(task_stage_raw)
-            except Exception:
-                task_stage = FileStage.PRELIMS
-
-            tracking_doc = stage_service.get_file_tracking(file_id)
-            tracking = _parse_file_tracking_safely(tracking_doc) if isinstance(tracking_doc, dict) else tracking_doc
-            if tracking and tracking.current_stage == task_stage:
-                stage_service.assign_employee_to_stage(file_id, assignment.employee_code, employee["employee_name"])
-        except Exception as e:
-            logger.warning(f"Failed to update stage tracking for task {task_id}: {e}")
-    
-    # Emit task assignment event to ClickHouse for real-time analytics
-    try:
-        from app.services.clickhouse_service import clickhouse_service
-        await clickhouse_service.emit_task_assigned_event(
-            task_id=task_id,
-            employee_code=assignment.employee_code,
-            employee_name=employee["employee_name"],
-            assigned_by=assignment.assigned_by,
-            file_id_param=task.get("source", {}).get("permit_file_id")
-        )
-    except Exception as e:
-        logger.warning(f"Failed to emit task_assigned event: {e}")
-    
-    # Send websocket notification to assigned employee
-    try:
-        from app.services.websocket_manager import websocket_manager
-        notification_data = {
-            "type": "task_assigned",
-            "task_id": task_id,
-            "employee_code": assignment.employee_code,
-            "employee_name": employee["employee_name"],
-            "task_description": task["description"],
-            "assigned_by": assignment.assigned_by,
-            "assigned_at": assigned_time.isoformat()
-        }
-        await websocket_manager.send_to_user(assignment.employee_code, notification_data)
-        logger.info(f"Notification sent to employee {assignment.employee_code} for task {task_id}")
-    except Exception as e:
-        logger.warning(f"Failed to send notification: {str(e)}")
-    
-    # Invalidate stage tracking cache to ensure immediate dashboard updates
-    try:
-        stage_service = get_stage_tracking_service()
-        # Clear the pipeline view cache
-        if hasattr(stage_service, '_cache') and 'pipeline_view' in stage_service._cache:
-            del stage_service._cache['pipeline_view']
-            logger.info(f"Invalidated stage tracking cache after task {task_id} assignment")
-    except Exception as e:
-        logger.warning(f"Failed to invalidate stage tracking cache: {e}")
-    
-    # ENSURE DASHBOARD VISIBILITY: Create file tracking for standalone tasks
-    try:
-        stage_service = get_stage_tracking_service()
-        file_id = task.get("source", {}).get("permit_file_id")
+            logger.warning(f"Failed to emit ClickHouse event: {e}")
         
-        # If no file_id exists, create virtual file tracking for dashboard visibility
-        if not file_id:
-            file_id = f"TASK-{task_id}"
-            task_stage_raw = task.get("stage") or "PRELIMS"
-            try:
-                task_stage = FileStage(task_stage_raw)
-            except Exception:
-                task_stage = FileStage.PRELIMS
-            
-            # Check if file tracking already exists
-            existing_tracking = stage_service.get_file_tracking(file_id)
-            if not existing_tracking:
-                # Initialize file tracking for dashboard visibility
-                stage_service.initialize_file_tracking(file_id, task_stage)
-                
-                # Link to task for reference
-                db.file_tracking.update_one(
-                    {"file_id": file_id},
-                    {"$set": {
-                        "linked_task_id": task_id,
-                        "task_type": "standalone_task",
-                        "task_title": task.get("title", ""),
-                        "virtual_file": True
-                    }}
-                )
-                logger.info(f"Created file tracking for standalone task {task_id} -> {file_id}")
-            
-            # Assign employee to the file tracking for dashboard visibility
-            stage_service.assign_employee_to_stage(
-                file_id=file_id,
-                employee_code=assignment.employee_code,
-                notes=f"Task assignment: {task.get('title', 'N/A')}"
-            )
-            logger.info(f"Assigned employee {assignment.employee_code} to file tracking {file_id}")
-            
-    except Exception as e:
-        logger.warning(f"Failed to create file tracking for task {task_id}: {e}")
-    
-    return {
-        "task_id": task_id,
-        "assigned_to": assignment.employee_code,
-        "assigned_to_name": employee["employee_name"],
-        "status": "ASSIGNED",
-        "profile_updated": True,
-        "message": "Task assigned and added to employee profile"
-    }
-
-@router.post("/{task_id}/start")
-async def start_task(task_id: str, employee_code: str = Query(...)):
-    """Start work on a task - update status from ASSIGNED to IN_PROGRESS"""
-    db = get_db()
-    
-    start_time = datetime.utcnow()
-    
-    # Get task
-    task = db.tasks.find_one({"task_id": task_id})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Validate task is assigned to this employee
-    if task.get("assigned_to") != employee_code:
-        raise HTTPException(status_code=403, detail="Task not assigned to this employee")
-    
-    # Validate task is in ASSIGNED status
-    if task.get("status") != "ASSIGNED":
-        raise HTTPException(status_code=400, detail=f"Task cannot be started. Current status: {task.get('status')}")
-    
-    # Update task status to IN_PROGRESS
-    db.tasks.update_one(
-        {"task_id": task_id},
-        {
-            "$set": {
-                "status": "IN_PROGRESS",
-                "work_started_at": start_time,
-                "metadata.updated_at": start_time
-            }
-        }
-    )
-    
-    # Update profile_building collection
-    db.profile_building.update_one(
-        {"employee_code": employee_code},
-        {
-            "$set": {
-                "status": "IN_PROGRESS",
-                "work_started_at": start_time,
-                "updated_at": start_time
-            }
-        }
-    )
-    
-    # Emit stage started event to ClickHouse for real-time analytics
-    try:
-        from app.services.clickhouse_service import clickhouse_service
-        await clickhouse_service.emit_stage_started_event(
-            task_id=task_id,
-            employee_code=employee_code,
-            employee_name=task.get("assigned_to_name", f"Employee {employee_code}"),
-            stage=task.get("stage", "PRELIMS"),
-            file_id=task.get("source", {}).get("permit_file_id")
-        )
-    except Exception as e:
-        logger.warning(f"Failed to emit stage_started event: {e}")
-    
-    # Send websocket notification
-    try:
-        from app.services.websocket_manager import websocket_manager
-        notification_data = {
-            "type": "task_started",
-            "task_id": task_id,
-            "employee_code": employee_code,
-            "task_description": task["description"],
-            "work_started_at": start_time.isoformat()
-        }
-        await websocket_manager.send_to_user(employee_code, notification_data)
-        logger.info(f"Work started notification sent for task {task_id} by employee {employee_code}")
-    except Exception as e:
-        logger.warning(f"Failed to send start work notification: {str(e)}")
-    
-    return {
-        "task_id": task_id,
-        "employee_code": employee_code,
-        "status": "IN_PROGRESS",
-        "work_started_at": start_time.isoformat() + 'Z',
-        "message": "Work started successfully"
-    }
-
-@router.post("/{task_id}/complete")
-async def complete_task(task_id: str, employee_code: str = Query(...)):
-    """Mark task as complete and update profile_building"""
-    db = get_db()
-    
-    completion_time = datetime.utcnow()
-    
-    # Get task
-    task = db.tasks.find_one({"task_id": task_id})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Update task status
-    db.tasks.update_one(
-        {"task_id": task_id},
-        {
-            "$set": {
-                "status": "COMPLETED",
-                "completed_at": completion_time,
-                "completed_by": employee_code,
-                "metadata.updated_at": completion_time
-            }
-        }
-    )
-    
-    # Calculate duration for analytics
-    work_started_at = task.get("work_started_at") or task.get("assigned_at")
-    duration_minutes = 0
-    if work_started_at and isinstance(work_started_at, datetime):
-        if isinstance(completion_time, datetime):
-            duration_minutes = int((completion_time - work_started_at).total_seconds() / 60)
-        elif isinstance(completion_time, str):
-            completion_dt = datetime.fromisoformat(completion_time.replace('Z', '+00:00'))
-            duration_minutes = int((completion_dt - work_started_at).total_seconds() / 60)
-    
-    # Emit stage completed event to ClickHouse for real-time analytics
-    try:
-        from app.services.clickhouse_service import clickhouse_service
-        await clickhouse_service.emit_stage_completed_event(
-            task_id=task_id,
-            employee_code=employee_code,
-            employee_name=task.get("assigned_to_name", f"Employee {employee_code}"),
-            stage=task.get("stage", "UNKNOWN"),
-            duration_minutes=duration_minutes,
-            file_id_param=task.get("source", {}).get("permit_file_id")
-        )
-        
-        # Update file_lifecycle.current_stage for real-time tracking
-        file_id = task.get("source", {}).get("permit_file_id")
-        if file_id:
-            # Determine next stage based on current stage
-            current_stage = task.get("stage", "PRELIMS")
-            if current_stage == "PRODUCTION":
-                # After completing production, move to COMPLETED
-                clickhouse_service.update_file_stage(file_id, "COMPLETED")
-                logger.info(f"Updated file_lifecycle stage for {file_id} to COMPLETED")
-            elif current_stage == "QC":
-                # After completing QC, move to DELIVERED
-                clickhouse_service.update_file_stage(file_id, "DELIVERED")
-                logger.info(f"Updated file_lifecycle stage for {file_id} to DELIVERED")
-        
-    except Exception as e:
-        logger.warning(f"Failed to emit stage_completed event: {e}")
-    
-    # Update employee profile
-    if task_id and task_id.strip():  # Ensure task_id is not null or empty
-        try:
-            db.profile_building.update_one(
-                {"employee_code": employee_code},
-                {
-                    "$push": {
-                        "completed_tasks": {
-                            "task_id": task_id,
-                            "task_title": task.get("task_title", "Untitled Task"),
-                            "completed_at": completion_time.isoformat() + 'Z',
-                            "skills": task.get("skills_required", [])
-                        }
-                    },
-                    "$set": {"metadata.updated_at": completion_time}
-                },
-        upsert=True
-            )
-        except Exception as e:
-            logger.error(f"Failed to update employee profile for {employee_code}: {e}")
-            # Don't fail the entire operation if profile update fails
-    else:
-        logger.warning(f"Skipping profile update for invalid task_id: {task_id}")
-    
-    # Auto-progress file tracking based on task completion (single source of truth: StageTrackingService)
-    file_id = task.get("source", {}).get("permit_file_id")
-    auto_progressed = False
-    new_stage = None
-    if file_id:
-        try:
-            stage_service = get_stage_tracking_service()
-            before_doc = stage_service.get_file_tracking(file_id)
-            before = _parse_file_tracking_safely(before_doc) if isinstance(before_doc, dict) else before_doc
-            before_stage = before.current_stage.value if before and hasattr(before.current_stage, "value") else None
-
-            after = stage_service.auto_progress_from_tasks(file_id)
-            after_stage = after.current_stage.value if after and hasattr(after.current_stage, "value") else None
-            auto_progressed = bool(after_stage and before_stage and after_stage != before_stage)
-            new_stage = after_stage
-
-            if auto_progressed:
-                logger.info(f"Auto-progressed file {file_id} from {before_stage} to {after_stage} after task completion")
-        except Exception as e:
-            logger.warning(f"Failed to auto-progress file {file_id} after task completion: {e}")
-    
-    # Broadcast task completion via WebSocket and SSE
-    try:
-        from app.api.v1.routers.websocket_events import websocket_manager
-        
-        # For WebSocket clients (two-way)
-        await websocket_manager.broadcast_task_update({
-            "task_id": task_id,
-            "assigned_to": employee_code,
-            "stage": task.get("stage"),
-            "action": "completed",
-            "completed_at": completion_time.isoformat() + 'Z',
-            "file_id": task.get("source", {}).get("permit_file_id"),
-            "auto_progressed": auto_progressed,
-            "file_new_stage": new_stage
-        })
-        
-        # For SSE clients (one-way)
-        await websocket_manager.broadcast_one_way_update("task_completed", {
-            "task_id": task_id,
-            "assigned_to": employee_code,
-            "stage": task.get("stage"),
-            "completed_at": completion_time.isoformat() + 'Z',
-            "file_id": task.get("source", {}).get("permit_file_id"),
-            "auto_progressed": auto_progressed,
-            "file_new_stage": new_stage,
-            "timestamp": completion_time.isoformat()
-        })
-        
-        # Sync to ClickHouse for analytics
-        try:
-            from app.services.sync_service import sync_service
-            await sync_service.sync_task_completion(task_id, employee_code)
-        except Exception as e:
-            logger.warning(f"Failed to sync to ClickHouse: {e}")
-        
-    except Exception as e:
-        logger.warning(f"Failed to broadcast task completion: {e}")
-    
-    return {
-        "success": True,
-        "message": "Task completed successfully",
-        "task_id": task_id,
-        "completed_at": completion_time.isoformat() + 'Z',
-        "auto_progressed": auto_progressed,
-        "file_new_stage": new_stage
-    }
-
-@router.post("/{task_id}/recommendations")
-async def get_task_recommendations(task_id: str, top_k: int = 5):
-    """Get employee recommendations for a task using embeddings"""
-    db = get_db()
-    
-    # Get task with embedding
-    task = db.tasks.find_one({"task_id": task_id})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    task_embedding = task["embeddings"]["description_embedding"]
-    
-    # Get all employees with embeddings
-    employees = list(db.employee.find({
-        "embeddings.profile_embedding": {"$exists": True}
-    }))
-    
-    recommendations = []
-    
-    for emp in employees:
-        emp_embedding = emp["embeddings"]["profile_embedding"]
-        
-        # Calculate cosine similarity
-        similarity = np.dot(task_embedding, emp_embedding) / (
-            np.linalg.norm(task_embedding) * np.linalg.norm(emp_embedding)
-        )
-        
-        recommendations.append({
-            "employee_code": emp["employee_code"],
-            "employee_name": emp["employee_name"],
-            "similarity_score": float(similarity),
-            "match_percentage": int(similarity * 100),
-            "current_role": emp["employment"]["current_role"],
-            "technical_skills": emp["skills"]["technical_skills"][:200],
-            "shift": emp["employment"]["shift"],
-            "status": emp["employment"]["status_1"]
-        })
-    
-    # Sort by similarity
-    recommendations.sort(key=lambda x: x["similarity_score"], reverse=True)
-    
-    return {
-        "task_id": task_id,
-        "recommendations": recommendations[:top_k]
-    }
-
-@router.get("/employee/{employee_code}/stats")
-async def get_employee_task_stats(employee_code: str):
-    """Get task statistics for an employee"""
-    db = get_db()
-    
-    # Get all tasks for the employee
-    assigned_tasks = list(db.tasks.find({"assigned_to": employee_code}))
-    
-    # Calculate statistics
-    total_assigned = len(assigned_tasks)
-    completed_tasks = [t for t in assigned_tasks if t.get("status") == "COMPLETED"]
-    total_completed = len(completed_tasks)
-    
-    # Calculate total time taken for completed tasks
-    total_hours = 0
-    for task in completed_tasks:
-        if task.get("assigned_at") and task.get("completed_at"):
-            try:
-                # Handle different date formats
-                assigned_at = task["assigned_at"]
-                completed_at = task["completed_at"]
-                
-                # Parse assigned_at
-                if isinstance(assigned_at, str):
-                    if assigned_at.endswith('Z'):
-                        assigned_time = datetime.fromisoformat(assigned_at.replace('Z', '+00:00'))
-                    else:
-                        assigned_time = datetime.fromisoformat(assigned_at)
-                elif isinstance(assigned_at, datetime):
-                    assigned_time = assigned_at
-                else:
-                    continue
-                
-                # Parse completed_at
-                if isinstance(completed_at, str):
-                    if completed_at.endswith('Z'):
-                        completed_time = datetime.fromisoformat(completed_at.replace('Z', '+00:00'))
-                    else:
-                        completed_time = datetime.fromisoformat(completed_at)
-                elif isinstance(completed_at, datetime):
-                    completed_time = completed_at
-                else:
-                    continue
-                
-                hours = (completed_time - assigned_time).total_seconds() / 3600
-                total_hours += hours
-            except Exception as e:
-                # Skip if date parsing fails
-                continue
-    
-    # Get recent tasks (last 5)
-    recent_tasks = sorted(assigned_tasks, 
-                         key=lambda x: x.get("assigned_at", ""), 
-                         reverse=True)[:5]
-    
-    # Format dates for recent tasks
-    for task in recent_tasks:
-        if task.get("assigned_at") and isinstance(task["assigned_at"], datetime):
-            task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
-        if task.get("completed_at") and isinstance(task["completed_at"], datetime):
-            task["completed_at"] = task["completed_at"].isoformat() + 'Z'
-    
-    return {
-        "employee_code": employee_code,
-        "total_assigned": total_assigned,
-        "total_completed": total_completed,
-        "pending_tasks": total_assigned - total_completed,
-        "completion_rate": round((total_completed / total_assigned * 100), 2) if total_assigned > 0 else 0,
-        "total_hours_worked": round(total_hours, 2),
-        "average_hours_per_task": round(total_hours / total_completed, 2) if total_completed > 0 else 0,
-        "recent_tasks": [
-            {
-                "task_id": t.get("task_id"),
-                "title": t.get("title"),
-                "status": t.get("status"),
-                "assigned_at": t.get("assigned_at"),
-                "completed_at": t.get("completed_at")
-            } for t in recent_tasks
-        ]
-    }
-
-@router.post("/assign-qa")
-async def assign_quality_assurance(file_id: str, employee_code: str, assigned_by: str = "manual"):
-    """Assign file for Quality Assurance (only from COMPLETED stage)"""
-    db = get_db()
-    
-    try:
-        # First verify file is in COMPLETED stage
-        service = get_stage_tracking_service()
-        tracking = service.get_file_tracking(file_id)
-        
-        if not tracking:
-            raise HTTPException(status_code=404, detail=f"File {file_id} not found")
-        
-        current_stage = tracking.get("current_stage")
-        if current_stage != "COMPLETED":
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Cannot assign QA - file is in {current_stage} stage, must be in COMPLETED stage"
-            )
-        
-        # Get employee details
-        employee = db.employee.find_one({"employee_code": employee_code})
-        if not employee:
-            raise HTTPException(status_code=404, detail="Employee not found")
-        
-        # Create QA task
-        qa_task_data = {
-            "task_id": f"TASK-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}",
-            "task_title": f"QA Review - {file_id}",
-            "task_description": f"Quality assurance review for completed file {file_id}",
-            "skills_required": ["QUALITY", "REVIEW", "ANALYSIS"],
-            "workflow_step": "QUALITY_ASSURANCE",
-            "estimated_hours": 2,
-            "priority": "high",
-            "assigned_to": employee_code,
-            "assigned_to_name": employee["employee_name"],
-            "assigned_by": assigned_by,
-            "assigned_at": datetime.utcnow(),
-            "status": "ASSIGNED",
-            "file_id": file_id,
-            "created_at": datetime.utcnow(),
-            "metadata": {
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
-                "qa_assignment": True
-            }
-        }
-        
-        # Insert QA task
-        db.tasks.insert_one(qa_task_data)
-        
-        # Update employee profile
-        db.profile_building.update_one(
-            {"employee_code": employee_code},
-            {
-                "$push": {
-                    "current_tasks": {
-                        "task_id": qa_task_data["task_id"],
-                        "task_title": qa_task_data["task_title"],
-                        "assigned_at": qa_task_data["assigned_at"].isoformat() + 'Z',
-                        "status": "ASSIGNED"
-                    }
-                },
-                "$set": {"metadata.updated_at": datetime.utcnow()}
-            },
-            upsert=True
-        )
+        logger.info(f"🎯 TASK ASSIGNED: Task '{task_id}' assigned to employee {resolved_assignment.employee_code} ({employee_name}) by {resolved_assignment.assigned_by}")
+        print(f"✅ TASK ASSIGNED: {task_id} → Employee {resolved_assignment.employee_code} ({employee_name})")
         
         return {
-            "success": True,
-            "message": f"QA task assigned successfully to {employee['employee_name']}",
-            "qa_task_id": qa_task_data["task_id"],
-            "file_id": file_id,
-            "employee_code": employee_code,
-            "employee_name": employee["employee_name"],
-            "assigned_at": qa_task_data["assigned_at"].isoformat() + 'Z'
+            "message": "Task assigned successfully",
+            "task_id": task_id,
+            "employee_code": resolved_assignment.employee_code,
+            "assigned_by": resolved_assignment.assigned_by,
+            "assigned_at": datetime.now(timezone.utc).isoformat(),
+            "duplicate_warning": duplicate_warning  # non-null if same file had active tasks
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"QA assignment failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"QA assignment failed: {str(e)}")
+        logger.error(f"[TASK-ASSIGN-ERROR] Failed to assign task {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to assign task: {str(e)}")
 
 
-# Automation endpoint for frontend integration
-class AutomationRequest(BaseModel):
-    file_id: str
-    filename: str
-    project_name: str = "Automated Project"
-    client_name: str = "Client"
-    priority: str = "normal"
-    team_lead_id: str = None  # Team lead for employee filtering
-    requirements: Dict[str, Any] = {}
-
-@router.post("/start-automation")
-async def start_automation(request: AutomationRequest):
-    """Start automation workflow for a file"""
+@router.post("/{task_id}/start")
+async def start_task(task_id: str, employee_code: str = Query(...)):
+    """Start work on a task"""
+    logger.info(f"[TASK-START] Employee {employee_code} starting task {task_id}")
+    
     try:
-        from clients.workflow_client import workflow_client
+        db = get_db()
         
-        # Connect to Temporal
-        await workflow_client.connect()
+        # Verify task exists and is assigned to this employee
+        task = db.tasks.find_one({"task_id": task_id})
         
-        # Start workflow
-        workflow_id = await workflow_client.start_file_workflow({
-            "file_id": request.file_id,
-            "filename": request.filename,
-            "project_name": request.project_name,
-            "client_name": request.client_name,
-            "priority": request.priority,
-            "team_lead_id": request.team_lead_id,  # Pass team lead for filtering
-            "requirements": request.requirements or {
-                "skills_needed": ["review", "analysis"],
-                "estimated_hours": {"prelims": 2, "production": 4, "quality": 1}
-            }
-        })
+        if not task:
+            logger.warning(f"[TASK-START-WARNING] Task {task_id} not found")
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
-        logger.info(f"Automation started for {request.file_id}: {workflow_id}")
+        # Normalize: build a list of possible codes (with and without leading zeros)
+        code_variants = list({employee_code, employee_code.lstrip('0') or employee_code, employee_code.zfill(4)})
+
+        if task.get("assigned_to") not in code_variants:
+            logger.warning(f"[TASK-START-WARNING] Task {task_id} not assigned to {employee_code}")
+            raise HTTPException(status_code=403, detail=f"Task not assigned to employee {employee_code}")
+        
+        # Update task status to IN_PROGRESS
+        update_data = {
+            "status": "IN_PROGRESS",
+            "started_at": datetime.now(timezone.utc),
+            "metadata.updated_at": datetime.now(timezone.utc)
+        }
+        
+        result = db.tasks.update_one(
+            {"task_id": task_id},
+            {"$set": update_data}
+        )
+        
+        if result.modified_count == 0:
+            logger.warning(f"[TASK-START-WARNING] Task {task_id} was not updated")
+        
+        # Emit ClickHouse event if enabled
+        try:
+            from app.services.clickhouse_service import clickhouse_service
+            if clickhouse_service.client:
+                # Call async method using the event loop
+                loop = asyncio.get_event_loop()
+                loop.create_task(clickhouse_service.emit_stage_started_event(
+                    task_id=task_id,
+                    employee_code=employee_code,
+                    employee_name=employee_code,  # Can't easily get name here without extra DB call, but that's okay
+                    stage=task.get("stage", "UNKNOWN"),
+                    file_id_param=task.get("file_id"),
+                    tracking_mode=task.get("tracking_mode")
+                ))
+                logger.info(f"[CLICKHOUSE-EVENT-TASK] Emitting task_started event for {task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to emit ClickHouse event: {e}")
+        
+        logger.info(f"[TASK-START-SUCCESS] Task {task_id} started by {employee_code}")
         
         return {
-            "success": True,
-            "message": "Automation workflow started",
-            "workflow_id": workflow_id,
-            "file_id": request.file_id
+            "message": "Task started successfully",
+            "task_id": task_id,
+            "employee_code": employee_code,
+            "status": "IN_PROGRESS",
+            "started_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[TASK-START-ERROR] Failed to start task {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to start task: {str(e)}")
+
+
+@router.get("/employee/{employee_code}/stats")
+async def get_employee_task_stats(employee_code: str):
+    """Get task statistics for an employee"""
+    logger.info(f"[TASK-STATS-START] Getting task stats for employee: {employee_code}")
+    
+    try:
+        db = get_db()
+        
+        # Get employee info
+        employee = db.employee.find_one({
+            "$or": [
+                {"employee_code": employee_code},
+                {"kekaemployeenumber": employee_code}
+            ]
+        }, {"_id": 0, "employee_name": 1, "employee_code": 1, "kekaemployeenumber": 1})
+        
+        if not employee:
+            logger.warning(f"[TASK-STATS-WARNING] Employee {employee_code} not found")
+            raise HTTPException(status_code=404, detail=f"Employee {employee_code} not found")
+        
+        # Get task statistics (match with/without leading zeros)
+        codes = {"$in": _code_variants(employee_code)}
+        total_tasks = db.tasks.count_documents({"assigned_to": codes})
+        completed_tasks = db.tasks.count_documents({"assigned_to": codes, "status": "COMPLETED"})
+        pending_tasks = db.tasks.count_documents({"assigned_to": codes, "status": {"$ne": "COMPLETED"}})
+        
+        # Get recent tasks
+        recent_tasks = list(db.tasks.find(
+            {"assigned_to": codes},
+            {"_id": 0, "task_id": 1, "title": 1, "status": 1, "assigned_at": 1, "due_date": 1}
+        ).sort("assigned_at", -1).limit(10))
+        
+        stats = {
+            "employee_code": employee_code,
+            "employee_name": employee.get("employee_name", f"Employee {employee_code}"),
+            "task_statistics": {
+                "total_tasks": total_tasks,
+                "completed_tasks": completed_tasks,
+                "pending_tasks": pending_tasks,
+                "completion_rate": round((completed_tasks / total_tasks * 100) if total_tasks > 0 else 0, 2)
+            },
+            "recent_tasks": recent_tasks,
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        logger.info(f"[TASK-STATS-SUCCESS] Retrieved stats for {employee_code}: {total_tasks} total, {completed_tasks} completed")
+        return stats
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[TASK-STATS-ERROR] Failed to get stats for {employee_code}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get employee task statistics")
+
+
+@router.get("/employee/{employee_code}/completed")
+async def get_employee_completed_tasks(employee_code: str):
+    """Get completed tasks for an employee"""
+    logger.info(f"[TASK-COMPLETED-START] Getting completed tasks for employee: {employee_code}")
+    
+    try:
+        db = get_db()
+        
+        # Get employee info
+        employee = db.employee.find_one({
+            "$or": [
+                {"employee_code": employee_code},
+                {"kekaemployeenumber": employee_code}
+            ]
+        }, {"_id": 0, "employee_name": 1, "employee_code": 1, "kekaemployeenumber": 1})
+        
+        if not employee:
+            logger.warning(f"[TASK-COMPLETED-WARNING] Employee {employee_code} not found")
+            raise HTTPException(status_code=404, detail=f"Employee {employee_code} not found")
+        
+        # Get completed tasks (match with/without leading zeros)
+        codes = {"$in": _code_variants(employee_code)}
+        completed_tasks = list(db.tasks.find(
+            {
+                "assigned_to": codes,
+                "status": "COMPLETED"
+            },
+            {
+                "_id": 0,
+                "task_id": 1,
+                "title": 1,
+                "description": 1,
+                "status": 1,
+                "assigned_at": 1,
+                "completed_at": 1,
+                "due_date": 1,
+                "estimated_hours": 1,
+                "file_id": 1,
+                "stage": 1
+            }
+        ).sort("completed_at", -1))
+        
+        # Format datetime fields
+        for task in completed_tasks:
+            if "assigned_at" in task and task["assigned_at"]:
+                task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
+            if "completed_at" in task and task["completed_at"]:
+                task["completed_at"] = task["completed_at"].isoformat() + 'Z'
+            if "due_date" in task and task["due_date"]:
+                task["due_date"] = task["due_date"].isoformat() + 'Z'
+        
+        result = {
+            "employee_code": employee_code,
+            "employee_name": employee.get("employee_name", f"Employee {employee_code}"),
+            "completed_tasks": completed_tasks,
+            "total_completed": len(completed_tasks),
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        logger.info(f"[TASK-COMPLETED-SUCCESS] Retrieved {len(completed_tasks)} completed tasks for {employee_code}")
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[TASK-COMPLETED-ERROR] Failed to get completed tasks for {employee_code}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch completed tasks")
+
+
+@router.get("/employee/{employee_code}/assigned")
+async def get_employee_assigned_tasks(employee_code: str):
+    """Get assigned (non-completed) tasks for an employee"""
+    logger.info(f"[TASK-ASSIGNED-START] Getting assigned tasks for employee: {employee_code}")
+    
+    try:
+        db = get_db()
+        
+        # Get employee info
+        employee = db.employee.find_one({
+            "$or": [
+                {"employee_code": employee_code},
+                {"kekaemployeenumber": employee_code}
+            ]
+        }, {"_id": 0, "employee_name": 1, "employee_code": 1, "kekaemployeenumber": 1})
+        
+        if not employee:
+            logger.warning(f"[TASK-ASSIGNED-WARNING] Employee {employee_code} not found")
+            raise HTTPException(status_code=404, detail=f"Employee {employee_code} not found")
+        
+        # Get assigned tasks (non-completed, match with/without leading zeros)
+        codes = {"$in": _code_variants(employee_code)}
+        assigned_tasks = list(db.tasks.find(
+            {
+                "assigned_to": codes,
+                "status": {"$ne": "COMPLETED"}
+            },
+            {
+                "_id": 0,
+                "task_id": 1,
+                "title": 1,
+                "description": 1,
+                "status": 1,
+                "assigned_at": 1,
+                "due_date": 1,
+                "estimated_hours": 1,
+                "file_id": 1,
+                "stage": 1,
+                "priority": 1
+            }
+        ).sort("assigned_at", -1))
+        
+        # Format datetime fields
+        for task in assigned_tasks:
+            if "assigned_at" in task and task["assigned_at"]:
+                task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
+            if "due_date" in task and task["due_date"]:
+                task["due_date"] = task["due_date"].isoformat() + 'Z'
+        
+        result = {
+            "employee_code": employee_code,
+            "employee_name": employee.get("employee_name", f"Employee {employee_code}"),
+            "assigned_tasks": assigned_tasks,
+            "total_assigned": len(assigned_tasks),
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        logger.info(f"[TASK-ASSIGNED-SUCCESS] Retrieved {len(assigned_tasks)} assigned tasks for {employee_code}")
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[TASK-ASSIGNED-ERROR] Failed to get assigned tasks for {employee_code}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch assigned tasks")
+
+
+@router.get("/team-lead-stats")
+async def get_team_lead_task_stats():
+    """Get task statistics for all team leads"""
+    logger.info(f"[TEAM-LEAD-STATS-START] Getting team lead task statistics")
+    
+    try:
+        db = get_db()
+        
+        import re
+        
+        # Get all employees with reporting_manager
+        employees = list(db.employee.find(
+            {"reporting_manager": {"$exists": True, "$ne": None, "$ne": ""}},
+            {"_id": 0, "employee_code": 1, "reporting_manager": 1}
+        ))
+        
+        # Group employees by team lead
+        team_groups = {}  # team_lead_code -> {name, codes[]}
+        for emp in employees:
+            manager = emp.get("reporting_manager", "")
+            if not manager:
+                continue
+            match = re.match(r"^(.+?)\s*\((\w+)\)\s*$", str(manager))
+            if match:
+                tl_name = match.group(1).strip()
+                tl_code = match.group(2).strip()
+            else:
+                tl_code = str(manager).strip()
+                tl_name = tl_code
+            
+            if tl_code not in team_groups:
+                team_groups[tl_code] = {"name": tl_name, "codes": []}
+            emp_code = emp.get("employee_code")
+            if emp_code:
+                team_groups[tl_code]["codes"].append(emp_code)
+        
+        # Build stats for each team lead
+        team_lead_stats = []
+        for tl_code, info in team_groups.items():
+            member_codes = info["codes"]
+            total = db.tasks.count_documents({"assigned_to": {"$in": member_codes}})
+            completed = db.tasks.count_documents({"assigned_to": {"$in": member_codes}, "status": "COMPLETED"})
+            pending = total - completed
+            rate = round((completed / total) * 100, 2) if total > 0 else 0.0
+            
+            team_lead_stats.append({
+                "team_lead_code": tl_code,
+                "team_lead_name": info["name"],
+                "total_employees": len(member_codes),
+                "task_statistics": {
+                    "total_tasks": total,
+                    "completed_tasks": completed,
+                    "pending_tasks": pending,
+                    "completion_rate": rate
+                }
+            })
+        
+        # Sort by total tasks descending
+        team_lead_stats.sort(key=lambda x: x["task_statistics"]["total_tasks"], reverse=True)
+        
+        result = {
+            "team_lead_stats": team_lead_stats,
+            "total_team_leads": len(team_lead_stats),
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        logger.info(f"[TEAM-LEAD-STATS-SUCCESS] Returning real stats for {len(team_lead_stats)} team leads")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[TEAM-LEAD-STATS-ERROR] Failed to get team lead stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch team lead task statistics")
+
+
+@router.get("/permit-file-tracking")
+async def get_permit_file_tracking():
+    """Get permit file tracking information"""
+    logger.info(f"[PERMIT-TRACKING-START] Getting permit file tracking data")
+    
+    try:
+        db = get_db()
+        
+        # Get permit files with their current status
+        permit_files = list(db.permit_files.find(
+            {},
+            {
+                "_id": 0,
+                "file_id": 1,
+                "permit_id": 1,
+                "address": 1,
+                "current_stage": 1,
+                "status": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "tasks_created": 1,
+                "metadata": 1
+            }
+        ).sort("created_at", -1).limit(50))
+        
+        # Format datetime fields
+        for permit in permit_files:
+            if "created_at" in permit and permit["created_at"]:
+                permit["created_at"] = permit["created_at"].isoformat() + 'Z'
+            if "updated_at" in permit and permit["updated_at"]:
+                permit["updated_at"] = permit["updated_at"].isoformat() + 'Z'
+        
+        # Get stage distribution
+        stage_distribution = {}
+        for permit in permit_files:
+            stage = permit.get("current_stage", "UNKNOWN")
+            stage_distribution[stage] = stage_distribution.get(stage, 0) + 1
+        
+        # Get recent tasks
+        recent_tasks = list(db.tasks.find(
+            {"file_id": {"$ne": None}},
+            {
+                "_id": 0,
+                "task_id": 1,
+                "file_id": 1,
+                "title": 1,
+                "status": 1,
+                "assigned_to": 1,
+                "assigned_at": 1
+            }
+        ).sort("assigned_at", -1).limit(20))
+        
+        # Format task datetime fields
+        for task in recent_tasks:
+            if "assigned_at" in task and task["assigned_at"]:
+                task["assigned_at"] = task["assigned_at"].isoformat() + 'Z'
+        
+        result = {
+            "permit_files": permit_files,
+            "stage_distribution": stage_distribution,
+            "recent_tasks": recent_tasks,
+            "summary": {
+                "total_permit_files": len(permit_files),
+                "active_files": len([p for p in permit_files if p.get("status") != "COMPLETED"]),
+                "completed_files": len([p for p in permit_files if p.get("status") == "COMPLETED"]),
+                "total_tasks": len(recent_tasks)
+            },
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        logger.info(f"[PERMIT-TRACKING-SUCCESS] Retrieved tracking data for {len(permit_files)} permit files")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[PERMIT-TRACKING-ERROR] Failed to get permit file tracking: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch permit file tracking")
+
+
+@router.get("/debug-employees")
+async def debug_employees():
+    """Debug endpoint to check employee data"""
+    try:
+        db = get_db()
+        
+        # Get first few employees
+        employees = list(db.employee.find({}).limit(3))
+        
+        # Count total employees
+        total_count = db.employee.count_documents({})
+        
+        return {
+            "total_employees": total_count,
+            "sample_employees": employees,
+            "sample_fields": list(employees[0].keys()) if employees else []
         }
         
     except Exception as e:
-        logger.error(f"Failed to start automation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to start automation: {str(e)}")
+        return {"error": str(e)}

@@ -6,7 +6,7 @@ import { Employee, FileStageHistory, TeamLeadGroup, Task, TaskAssignment, Permit
 import type { PipelineData, SLABreach } from '@/types/stageTracking';
 
 const API_BASE_URL = (() => {
-  const raw = import.meta.env.VITE_API_URL as string | undefined;
+  const raw = import.meta.env.VITE_API_BASE_URL as string | undefined;
   if (!raw) return '/api/v1';
   const trimmed = raw.replace(/\/+$/, '');
   if (trimmed.endsWith('/api/v1')) return trimmed;
@@ -21,7 +21,33 @@ function isApiDebugEnabled(): boolean {
   }
 }
 
-type ApiErrorPayload = { detail?: string };
+type ApiErrorPayload = { detail?: unknown };
+
+function formatApiErrorDetail(detail: unknown): string | null {
+  if (detail == null) return null;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    try {
+      return detail
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item === 'object' && 'msg' in (item as Record<string, unknown>)) {
+            const msg = (item as Record<string, unknown>).msg;
+            return typeof msg === 'string' ? msg : JSON.stringify(item);
+          }
+          return JSON.stringify(item);
+        })
+        .join('; ');
+    } catch {
+      return String(detail);
+    }
+  }
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(detail);
+  }
+}
 
 function apiDebugLog(...args: unknown[]): void {
   if (isApiDebugEnabled()) {
@@ -73,6 +99,9 @@ type EmployeeAssignedTasksResponse = {
 type TeamLeadTaskStatsResponse = {
   total_teams: number;
   team_stats: unknown[];
+  // Backend actual keys (mapped below)
+  total_team_leads?: number;
+  team_lead_stats?: unknown[];
 };
 
 type PermitFileTrackingResponse = {
@@ -138,7 +167,8 @@ export const api = {
 
     if (!response.ok) {
       const error = (await response.json().catch(() => ({ detail: 'Request failed' }))) as ApiErrorPayload;
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      const formatted = formatApiErrorDetail(error.detail);
+      throw new Error(formatted || `HTTP ${response.status}`);
     }
 
     const data = (await response.json()) as T;
@@ -162,7 +192,8 @@ export const api = {
 
     if (!response.ok) {
       const error = (await response.json().catch(() => ({ detail: 'Request failed' }))) as ApiErrorPayload;
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      const formatted = formatApiErrorDetail(error.detail);
+      throw new Error(formatted || `HTTP ${response.status}`);
     }
 
     const responseData = (await response.json()) as T;
@@ -185,8 +216,9 @@ export const api = {
     });
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Request failed' }));
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      const error = (await response.json().catch(() => ({ detail: 'Request failed' }))) as ApiErrorPayload;
+      const formatted = formatApiErrorDetail(error.detail);
+      throw new Error(formatted || `HTTP ${response.status}`);
     }
 
     const responseData = await response.json();
@@ -209,7 +241,8 @@ export const api = {
 
     if (!response.ok) {
       const error = (await response.json().catch(() => ({ detail: 'Request failed' }))) as ApiErrorPayload;
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      const formatted = formatApiErrorDetail(error.detail);
+      throw new Error(formatted || `HTTP ${response.status}`);
     }
 
     const data = (await response.json()) as T;
@@ -242,7 +275,8 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
   if (!response.ok) {
     const error = (await response.json().catch(() => ({ detail: 'Request failed' }))) as ApiErrorPayload;
     console.error(`[API] Error response:`, error);
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    const formatted = formatApiErrorDetail(error.detail);
+    throw new Error(formatted || `HTTP ${response.status}`);
   }
 
   const jsonResponse = (await response.json()) as T;
@@ -299,7 +333,7 @@ export async function getEmployeeTasks(employeeCode: string): Promise<TaskAssign
     return JSON.parse(cached);
   }
   
-  const data = await apiRequest<TaskAssignment>(`/employees/${employeeCode}/tasks`);
+  const data = await apiRequest<TaskAssignment>(`/employee-tasks/${employeeCode}`);
   
   // Cache the results
   localStorage.setItem(cacheKey, JSON.stringify(data));
@@ -333,7 +367,8 @@ export async function assignTaskToEmployee(
   employeeCode: string,
   taskDescription: string,
   assignedBy: string,
-  permitFileId?: string
+  fileId?: string,
+  assignmentSource: string = 'manual'
 ): Promise<unknown> {
   apiDebugLog(`[API] Creating and assigning task to ${employeeCode}`);
   
@@ -343,18 +378,19 @@ export async function assignTaskToEmployee(
       task_id: string; 
       validation_warning?: string;
       detected_stage?: string;
+      tracking_mode?: string;
     }>('/tasks/create', {
       method: 'POST',
       body: JSON.stringify({
         title: taskDescription,
         description: taskDescription,
         skills_required: [],
-        permit_file_id: permitFileId,
-        assigned_by: assignedBy,
+        id: fileId, // Use 'id' for MySQL field mapping to file_id
+        creatorparentid: assignedBy, // MySQL field for assigned_by
         due_date: null,
         estimated_hours: null,
         created_from: "manual_assignment",
-        assignment_source: "manual"  // Mark as manual assignment
+        assignment_source: assignmentSource
       }),
     });
     
@@ -372,11 +408,19 @@ export async function assignTaskToEmployee(
     
     apiDebugLog(`[API] Task assigned successfully:`, assignResponse);
     
+    // Invalidate caches to ensure fresh data is fetched
+    localStorage.removeItem(`employee_tasks_${employeeCode}`);
+    localStorage.removeItem(`employee_tasks_${employeeCode}_time`);
+    localStorage.removeItem('assigned_tasks');
+    localStorage.removeItem('assigned_tasks_time');
+    apiDebugLog(`[API] Cache invalidated for employee ${employeeCode}`);
+    
     // Return both assign response and any validation warning
     return {
       ...(assignResponse && typeof assignResponse === 'object' ? assignResponse : {}),
       validation_warning: createResponse.validation_warning,
-      detected_stage: createResponse.detected_stage
+      detected_stage: createResponse.detected_stage,
+      tracking_mode: createResponse.tracking_mode
     };
   } catch (error) {
     console.error(`[API] Failed to assign task:`, error);
@@ -406,6 +450,16 @@ type PermitFileApiItem = {
   };
   assigned_to_lead?: string;
   workflow_step?: PermitFile['workflow_step'];
+  current_assignment?: {
+    employee_code: string;
+    employee_name: string;
+    stage: string;
+    assigned_at?: string;
+  };
+  acceptance?: {
+    accepted_by?: string;
+    accepted_at?: string;
+  };
 };
 
 export async function getPermitFiles(params?: {
@@ -453,6 +507,19 @@ function transformPermitFiles(data: PermitFileApiItem[]): PermitFile[] {
             project_name: file.project_details.project_name,
           }
         : undefined;
+        
+    // Extract employee assignment from either current_assignment or acceptance fallback
+    let current_assignment = undefined;
+    if (file.current_assignment) {
+      current_assignment = file.current_assignment;
+    } else if (file.acceptance?.accepted_by) {
+      current_assignment = {
+        employee_code: file.acceptance.accepted_by, // Use name as code fallback if needed
+        employee_name: file.acceptance.accepted_by,
+        stage: file.workflow_step || 'PRELIMS',
+        assigned_at: file.acceptance.accepted_at || new Date().toISOString()
+      };
+    }
 
     return {
       _id: file.file_id,
@@ -461,7 +528,7 @@ function transformPermitFiles(data: PermitFileApiItem[]): PermitFile[] {
       file_type: (file.project_details?.client_name || 'NEW') as PermitFile['file_type'],
       status: file.status || 'PENDING',
       state: file.project_details?.project_name,
-      client: file.client || file.project_details?.client_name, // Use mapped client
+      client: file.project_details?.client_name || file.client, // Prioritize project_details.client_name
       created_at: file.metadata?.created_at || file.file_info?.uploaded_at || '',
       updated_at: file.metadata?.updated_at || '',
       file_path: file.file_info?.file_path,
@@ -471,6 +538,7 @@ function transformPermitFiles(data: PermitFileApiItem[]): PermitFile[] {
       project_details: projectDetails,
       assigned_to_lead: file.assigned_to_lead,
       workflow_step: file.workflow_step, // Include workflow step
+      current_assignment, // Attach the resolved assignment
     };
   });
 }
@@ -506,9 +574,10 @@ export async function uploadPermitFile(
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Upload failed' }));
+    const error = (await response.json().catch(() => ({ detail: 'Upload failed' }))) as ApiErrorPayload;
     console.error('[API Error] File upload failed:', error);
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    const formatted = formatApiErrorDetail(error.detail);
+    throw new Error(formatted || `HTTP ${response.status}`);
   }
 
   const uploadResult = (await response.json()) as PermitFile;
@@ -539,12 +608,81 @@ export async function smartUploadAndAssign(
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'ZIP-based upload failed' }));
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    const error = (await response.json().catch(() => ({ detail: 'ZIP-based upload failed' }))) as ApiErrorPayload;
+    const formatted = formatApiErrorDetail(error.detail);
+    throw new Error(formatted || `HTTP ${response.status}`);
   }
 
   const data = (await response.json()) as unknown;
   return data;
+}
+
+// Initialize stage tracking for a file if it doesn't exist
+export async function initializeStageTracking(fileId: string, stage: string = 'PRELIMS'): Promise<boolean> {
+  try {
+    if (!fileId) return false;
+    const response = await apiRequest('/stage-tracking/initialize', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file_id: fileId,
+        initial_stage: stage
+      })
+    });
+    
+    // Type assertion to ensure response has success property
+    const result = response as { success: boolean };
+    return result.success;
+  } catch (error) {
+    console.error('Failed to initialize stage tracking:', error);
+    return false;
+  }
+}
+
+export async function uploadFileOnly(
+  file: File,
+  taskDescription: string,
+  assignedBy: string
+): Promise<{file_id: string, file_name: string}> {
+  const formData = new FormData();
+  formData.append('pdf', file);
+  formData.append('client_name', 'Smart Recommender Upload');
+  formData.append('project_name', taskDescription);
+  formData.append('assigned_to_lead', 'SYSTEM'); // Will be reassigned based on recommendations
+  formData.append('workflow_step', 'PRELIMS');
+
+  const response = await fetch(`${API_BASE_URL}/permit-files/upload`, {
+    method: 'POST',
+    headers: {
+      'X-Employee-Code': getEmployeeCode(),
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({ detail: 'File upload failed' }))) as ApiErrorPayload;
+    const formatted = formatApiErrorDetail(error.detail);
+    throw new Error(formatted || `HTTP ${response.status}`);
+  }
+
+  const data = (await response.json()) as unknown;
+  const obj = (data ?? {}) as Record<string, any>;
+
+  const fileIdFromRoot = typeof obj.file_id === 'string' ? obj.file_id : null;
+  const fileIdFromExisting = typeof obj.existing_file?.file_id === 'string' ? obj.existing_file.file_id : null;
+  const fileId = fileIdFromRoot || fileIdFromExisting;
+
+  if (!fileId) {
+    const message = typeof obj.message === 'string' ? obj.message : null;
+    throw new Error(message || 'File upload succeeded but no file_id was returned');
+  }
+
+  return {
+    file_id: fileId,
+    file_name: file.name,
+  };
 }
 
 export async function getReportingManagerOverview(days: number = 7, limitEmployees: number = 5): Promise<unknown> {
@@ -575,9 +713,10 @@ export async function uploadFileWithAutomation(formData: FormData): Promise<unkn
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Upload failed' }));
+    const error = (await response.json().catch(() => ({ detail: 'Upload failed' }))) as ApiErrorPayload;
     console.error('[API Error] File upload failed:', error);
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    const formatted = formatApiErrorDetail(error.detail);
+    throw new Error(formatted || `HTTP ${response.status}`);
   }
 
   const uploadResult = await response.json();
@@ -599,19 +738,121 @@ export async function getUnassignedFiles(): Promise<PermitFile[]> {
   return files;  // Return array directly, not wrapped in object
 }
 
+export interface RecommendationResponse {
+  recommendations: Recommendation[];
+  total_found: number;
+  query_info: {
+    task_description: string;
+    team_lead_code?: string;
+    team_lead_name?: string;
+    location_source?: string;
+    resolved_zip?: string;
+    location_filter_applied: boolean;
+    processing_time_ms: number;
+    mysql_integration?: {
+      enabled: boolean;
+      mysql_permit_fetched: boolean;
+    };
+  };
+}
+
 export async function getEmployeeRecommendations(
   taskDescription: string,
   teamLeadCode?: string,
   topK: number = 10,
-  minSimilarity: number = 0.1
-): Promise<Recommendation[]> {
+  minSimilarity: number = 0.1,
+  address?: string,
+  fileId?: string
+): Promise<RecommendationResponse> {
   apiDebugLog('[API] Getting recommendations for:', taskDescription);
   apiDebugLog('[API] Team lead code:', teamLeadCode);
+  apiDebugLog('[API] Address:', address);
+  apiDebugLog('[API] File ID:', fileId);
   
   try {
     // Direct fetch without authentication for recommendations endpoint
     const url = `${API_BASE_URL}/tasks/recommend`;
     apiDebugLog(`[API] Making direct request to: ${url}`);
+    
+    const requestBody: any = {
+      task_description: taskDescription,
+      top_k: topK,
+      min_similarity: minSimilarity.toString()
+    };
+    
+    if (teamLeadCode) {
+      requestBody.team_lead_code = teamLeadCode;
+    }
+    
+    if (address) {
+      requestBody.address = address;
+    }
+    
+    if (fileId) {
+      requestBody.file_id = fileId;
+    }
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[API] Response not OK:', response.status, errorText);
+      throw new Error(`Failed to get recommendations: ${response.status} ${errorText}`);
+    }
+
+    const jsonResponse = await response.json();
+    apiDebugLog(`[API] JSON response:`, jsonResponse);
+    
+    if (!jsonResponse || !jsonResponse.recommendations) {
+      console.error('[API] Invalid response structure:', jsonResponse);
+      return {
+        recommendations: [],
+        total_found: 0,
+        query_info: {
+          task_description: taskDescription,
+          location_filter_applied: false,
+          processing_time_ms: 0
+        }
+      };
+    }
+
+    apiDebugLog('[API] Recommendations array:', jsonResponse.recommendations);
+    apiDebugLog('[API] Total found:', jsonResponse.total_found);
+    apiDebugLog('[API] Query info:', jsonResponse.query_info);
+
+    return jsonResponse;
+  } catch (error) {
+    console.error('[API] Error getting recommendations:', error);
+    throw error;
+  }
+}
+
+export async function getGeminiRecommendations(
+  taskDescription: string,
+  teamLeadCode?: string,
+  topK: number = 10,
+  minSimilarity: number = 0.5,
+  fileId?: string,
+  priority?: string,
+  requiredSkills?: string[],
+  filterByAvailability: boolean = true
+): Promise<{
+  recommendations: Recommendation[];
+  total_found: number;
+  query_info: Record<string, any>;
+}> {
+  apiDebugLog('[API] Getting Gemini recommendations for:', taskDescription);
+  apiDebugLog('[API] Team lead code:', teamLeadCode);
+  
+  try {
+    const url = `${API_BASE_URL}/task/recommend`;
+    apiDebugLog(`[API] Making Gemini request to: ${url}`);
     
     const response = await fetch(url, {
       method: 'POST',
@@ -621,34 +862,27 @@ export async function getEmployeeRecommendations(
       body: JSON.stringify({
         task_description: taskDescription,
         team_lead_code: teamLeadCode,
-        top_k: 10,
-        min_similarity: 0.3,  // Lower threshold to get more matches
+        top_k: topK,
+        min_similarity: minSimilarity,
+        file_id: fileId,
+        priority: priority,
+        required_skills: requiredSkills,
+        filter_by_availability: filterByAvailability
       }),
     });
 
-    apiDebugLog(`[API] Response status: ${response.status}`);
-    apiDebugLog(`[API] Response ok: ${response.ok}`);
-
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Request failed' }));
-      console.error(`[API] Error response:`, error);
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      const errorText = await response.text();
+      console.error('[API] Gemini response not OK:', response.status, errorText);
+      throw new Error(`Failed to get Gemini recommendations: ${response.status} ${errorText}`);
     }
 
     const jsonResponse = await response.json();
-    apiDebugLog(`[API] JSON response:`, jsonResponse);
+    apiDebugLog(`[API] Gemini JSON response:`, jsonResponse);
     
-    if (!jsonResponse || !jsonResponse.recommendations) {
-      console.error('[API] Invalid response structure:', jsonResponse);
-      return [];
-    }
-
-    apiDebugLog('[API] Recommendations array:', jsonResponse.recommendations);
-    apiDebugLog('[API] Total found:', jsonResponse.total_found);
-
-    return jsonResponse.recommendations;
+    return jsonResponse;
   } catch (error) {
-    console.error('[API] Error getting recommendations:', error);
+    console.error('[API] Error getting Gemini recommendations:', error);
     throw error;
   }
 }
@@ -736,7 +970,8 @@ export async function startTaskWork(taskId: string, employeeCode: string): Promi
   if (!response.ok) {
     const error = (await response.json().catch(() => ({ detail: 'Request failed' }))) as ApiErrorPayload;
     console.error(`[API] Error starting task work:`, error);
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    const formatted = formatApiErrorDetail(error.detail);
+    throw new Error(formatted || `HTTP ${response.status}`);
   }
   
   const result = (await response.json()) as unknown;
@@ -762,10 +997,12 @@ export async function getTeamLeadTaskStats(): Promise<TeamLeadTaskStatsResponse>
     return cached;
   }
 
+  const employeeCode = getEmployeeCode();
   const response = await fetch(`${API_BASE_URL}/tasks/team-lead-stats`, {
     method: 'GET',
     headers: {
       'Content-Type': 'application/json',
+      'Authorization': `Bearer ${employeeCode}`,
     },
   });
   
@@ -840,22 +1077,8 @@ export async function getEmployeeCompletedTasks(employeeCode: string): Promise<u
   
   apiDebugLog(`[API] Fetching completed tasks for employee: ${employeeCode}`);
   
-  const response = await fetch(`${API_BASE_URL}/tasks/employee/${employeeCode}/completed`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Employee-Code': getEmployeeCode(),
-    },
-  });
-  
-  if (!response.ok) {
-    throw new Error('Failed to fetch completed tasks');
-  }
-  
-  const data = (await response.json()) as JsonObject;
-  const tasks = (data as { tasks?: unknown }).tasks;
-  const tasksCount = Array.isArray(tasks) ? tasks.length : 0;
-  apiDebugLog(`[API] Retrieved ${tasksCount} completed tasks for ${employeeCode}`);
+  // Use the same endpoint as getEmployeeTasks - it returns both assigned and completed tasks
+  const data = await apiRequest<TaskAssignment>(`/employee-tasks/${employeeCode}`);
   return data;
 }
 
@@ -919,6 +1142,38 @@ export async function getStageTrackingDashboard(): Promise<StageTrackingDashboar
   return data;
 }
 
+export async function manualSyncMongoToClickhouse(): Promise<{
+  success: boolean;
+  message: string;
+  sync_time: string;
+  synced_files: number;
+  breached_files: number;
+  pipeline_summary: Record<string, number>;
+}> {
+  apiDebugLog('[API] Starting manual sync from MongoDB to ClickHouse');
+  
+  const response = await fetch(`${API_BASE_URL}/stage-tracking/manual-sync`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  
+  if (!response.ok) {
+    const errorData = (await response.json().catch(() => ({}))) as ApiErrorPayload;
+    const formatted = formatApiErrorDetail(errorData.detail);
+    throw new Error(formatted || 'Failed to perform manual sync');
+  }
+  
+  const data = await response.json();
+  
+  // Clear cache after successful sync to ensure fresh data
+  clearStageTrackingCache();
+  
+  apiDebugLog('[API] Manual sync completed:', data);
+  return data;
+}
+
 export function clearStageTrackingCache(): void {
   const cacheKey = 'stage_tracking_dashboard';
   localStorage.removeItem(cacheKey);
@@ -938,7 +1193,8 @@ export async function moveFileToQC(fileId: string, employeeCode: string): Promis
   
   if (!response.ok) {
     const errorData = (await response.json().catch(() => ({}))) as ApiErrorPayload;
-    throw new Error(errorData.detail || `Failed to move file ${fileId} to QC`);
+    const formatted = formatApiErrorDetail(errorData.detail);
+    throw new Error(formatted || `Failed to move file ${fileId} to QC`);
   }
   
   return (await response.json()) as unknown;
@@ -1016,20 +1272,36 @@ export async function createTask(taskData: {
   file_id?: string;
   task_type?: string;
 }): Promise<unknown> {
+  // Map file_id to 'id' for MySQL compatibility
+  const requestBody = {
+    ...taskData,
+    id: taskData.file_id, // MySQL field mapping
+  };
+  delete (requestBody as any).file_id; // Remove file_id from request
+  
   return apiRequest('/tasks/create', {
     method: 'POST',
-    body: JSON.stringify(taskData),
+    body: JSON.stringify(requestBody),
   });
 }
 
-export async function assignTask(taskId: string, employeeCode: string): Promise<unknown> {
-  return apiRequest(`/tasks/${taskId}/assign`, {
+export async function assignTask(taskId: string, employeeCode: string, assignedBy?: string): Promise<unknown> {
+  const result = await apiRequest(`/tasks/${taskId}/assign`, {
     method: 'POST',
     body: JSON.stringify({
       employee_code: employeeCode,
-      assigned_by: "frontend-user"
+      assigned_by: assignedBy || getEmployeeCode() || "frontend-user"
     }),
   });
+  
+  // Invalidate caches to ensure fresh data is fetched
+  localStorage.removeItem(`employee_tasks_${employeeCode}`);
+  localStorage.removeItem(`employee_tasks_${employeeCode}_time`);
+  localStorage.removeItem('assigned_tasks');
+  localStorage.removeItem('assigned_tasks_time');
+  apiDebugLog(`[API] Cache invalidated for employee ${employeeCode}`);
+  
+  return result;
 }
 
 export async function getTaskStatus(taskId: string): Promise<unknown> {

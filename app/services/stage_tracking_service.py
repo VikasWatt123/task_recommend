@@ -178,7 +178,7 @@ class StageTrackingService:
         def _incomplete_count(stage: FileStage) -> int:
             stage_val = _stage_value(stage)
             return self.db.tasks.count_documents({
-                "source.permit_file_id": file_id,
+                "$or": [{"source.permit_file_id": file_id}, {"file_id": file_id}],
                 "stage": stage_val,
                 "status": {"$nin": ["COMPLETED", "DONE"]},
             })
@@ -186,7 +186,7 @@ class StageTrackingService:
         def _total_count(stage: FileStage) -> int:
             stage_val = _stage_value(stage)
             return self.db.tasks.count_documents({
-                "source.permit_file_id": file_id,
+                "$or": [{"source.permit_file_id": file_id}, {"file_id": file_id}],
                 "stage": stage_val,
             })
 
@@ -201,7 +201,8 @@ class StageTrackingService:
         if current_stage in (FileStage.PRELIMS, FileStage.PRODUCTION, FileStage.QC):
             total = _total_count(current_stage)
             remaining = _incomplete_count(current_stage)
-            if total > 0 and remaining == 0 and tracking.stage_history:
+            # Auto-progress if there are no incomplete tasks (either no tasks or all tasks completed)
+            if remaining == 0 and tracking.stage_history:
                 before_stage_value = current_stage.value
                 assignment_employee_code = tracking.current_assignment.employee_code if tracking.current_assignment else ""
                 assignment_employee_name = tracking.current_assignment.employee_name if tracking.current_assignment else ""
@@ -214,12 +215,22 @@ class StageTrackingService:
                 if isinstance(entered_at, datetime):
                     current_hist.total_duration_minutes = max(0, int((now - entered_at).total_seconds() / 60))
 
+                # Update assignment completion in both current tracking and stage history
                 if tracking.current_assignment:
                     tracking.current_assignment.completed_at = now
                     if tracking.current_assignment.started_at and isinstance(tracking.current_assignment.started_at, datetime):
                         tracking.current_assignment.duration_minutes = max(
                             0,
                             int((now - tracking.current_assignment.started_at).total_seconds() / 60),
+                        )
+                
+                # Also update the assignment in the stage history
+                if current_hist.assigned_to:
+                    current_hist.assigned_to.completed_at = now
+                    if current_hist.assigned_to.started_at and isinstance(current_hist.assigned_to.started_at, datetime):
+                        current_hist.assigned_to.duration_minutes = max(
+                            0,
+                            int((now - current_hist.assigned_to.started_at).total_seconds() / 60),
                         )
 
                 # Stage-specific auto transitions
@@ -270,6 +281,33 @@ class StageTrackingService:
                     clickhouse_service.update_file_stage(file_id, new_stage_value)
                 except Exception:
                     pass
+                
+                # Also update permit_files collection to keep status in sync
+                try:
+                    # Map FileStage to permit_files status
+                    stage_to_status = {
+                        "PRELIMS": "IN_PRELIMS",
+                        "PRODUCTION": "IN_PRODUCTION", 
+                        "COMPLETED": "COMPLETED",
+                        "QC": "IN_QC",
+                        "DELIVERED": "DELIVERED"
+                    }
+                    
+                    new_status = stage_to_status.get(new_stage_value, "IN_PRELIMS")
+                    
+                    self.db.permit_files.update_one(
+                        {"file_id": file_id},
+                        {
+                            "$set": {
+                                "current_stage": new_stage_value,
+                                "status": new_status,
+                                "updated_at": now
+                            }
+                        }
+                    )
+                    logger.info(f"✅ Updated permit_files for {file_id} to {new_status} (auto-progress)")
+                except Exception as e:
+                    logger.warning(f"Failed to update permit_files for {file_id} during auto-progress: {e}")
 
                 # Emit stage completion/started events (best-effort)
                 try:
@@ -502,6 +540,13 @@ class StageTrackingService:
             except Exception as e:
                 logger.warning(f"Failed to auto-progress to COMPLETED: {e}")
         
+        # Automatic progression: QC → DELIVERED
+        elif tracking.current_stage.value == "QC":
+            try:
+                self._auto_progress_to_delivered(file_id, tracking, employee_code)
+            except Exception as e:
+                logger.warning(f"Failed to auto-progress to DELIVERED: {e}")
+        
         # Note: COMPLETED → QC requires manager action (no auto-progression)
         # Manager picks file from COMPLETED stage for QC
         
@@ -558,6 +603,33 @@ class StageTrackingService:
             logger.info(f"✅ Updated ClickHouse file_lifecycle for {file_id} to {tracking.current_stage.value}")
         except Exception as e:
             logger.warning(f"Failed to update ClickHouse file_lifecycle for {file_id}: {e}")
+        
+        # Also update permit_files collection to keep status in sync
+        try:
+            # Map FileStage to permit_files status
+            stage_to_status = {
+                "PRELIMS": "IN_PRELIMS",
+                "PRODUCTION": "IN_PRODUCTION", 
+                "COMPLETED": "COMPLETED",
+                "QC": "IN_QC",
+                "DELIVERED": "DELIVERED"
+            }
+            
+            new_status = stage_to_status.get(tracking.current_stage.value, "IN_PRELIMS")
+            
+            self.db.permit_files.update_one(
+                {"file_id": file_id},
+                {
+                    "$set": {
+                        "current_stage": tracking.current_stage.value,
+                        "status": new_status,
+                        "updated_at": tracking.updated_at
+                    }
+                }
+            )
+            logger.info(f"✅ Updated permit_files for {file_id} to {new_status}")
+        except Exception as e:
+            logger.warning(f"Failed to update permit_files for {file_id}: {e}")
         
         # Insert new stage history if not delivered
         if tracking.current_status != "DELIVERED" and tracking.stage_history:
@@ -685,6 +757,80 @@ class StageTrackingService:
             logger.warning(f"Failed to emit COMPLETED stage events: {e}")
         
         logger.info(f"Successfully auto-progressed file {file_id} to COMPLETED stage")
+    
+    def _auto_progress_to_delivered(self, file_id: str, tracking: FileTracking, employee_code: str):
+        """Automatically progress from QC to DELIVERED stage"""
+        from app.models.stage_flow import FileStage
+        
+        logger.info(f"Auto-progressing file {file_id} from QC to DELIVERED")
+        
+        now = datetime.utcnow()
+        
+        # Update tracking to DELIVERED
+        tracking.current_stage = FileStage.DELIVERED
+        tracking.current_assignment = None
+        tracking.current_status = "DELIVERED"
+        tracking.completed_at = now
+        tracking.updated_at = now
+        
+        # Calculate total duration
+        if tracking.started_at:
+            total_duration = now - tracking.started_at
+            tracking.total_duration_minutes = max(0, int(total_duration.total_seconds() / 60))
+        
+        # Create new stage history for DELIVERED
+        delivered_history = FileStageHistory(
+            file_id=file_id,
+            stage=FileStage.DELIVERED,
+            status="COMPLETED",
+            entered_stage_at=now,
+            completed_stage_at=now,
+            metadata={"auto_progressed": True, "from_stage": "QC", "progressed_by": employee_code}
+        )
+        tracking.stage_history.append(delivered_history)
+        
+        # Save to database
+        self.db[FILE_TRACKING_COLLECTION].update_one(
+            {"file_id": file_id},
+            {"$set": tracking.model_dump()}
+        )
+        
+        # Insert delivered stage history
+        self.db[STAGE_HISTORY_COLLECTION].insert_one(delivered_history.model_dump())
+        
+        # Keep ClickHouse in sync
+        try:
+            from app.services.clickhouse_service import clickhouse_service
+            clickhouse_service.update_file_stage(file_id, "DELIVERED")
+            logger.info(f"✅ Updated ClickHouse file_lifecycle for {file_id} to DELIVERED")
+        except Exception as e:
+            logger.warning(f"Failed to update ClickHouse file_lifecycle for {file_id}: {e}")
+        
+        # Emit DELIVERED stage event
+        try:
+            from app.services.clickhouse_service import clickhouse_service
+            clickhouse_service.emit_stage_completed_event(
+                task_id=f"FILE-{file_id}",
+                employee_code=employee_code,
+                employee_name=tracking.current_assignment.employee_name if tracking.current_assignment else "",
+                stage="QC",
+                duration_minutes=0,  # Immediate progression, no additional work duration
+                file_id=file_id
+            )
+            
+            # Also emit stage_started for DELIVERED to track the transition
+            clickhouse_service.emit_stage_started_event(
+                task_id=f"FILE-{file_id}",
+                employee_code="",
+                employee_name="",
+                stage="DELIVERED",
+                file_id=file_id
+            )
+            
+        except Exception as e:
+            logger.warning(f"Failed to emit DELIVERED stage events: {e}")
+        
+        logger.info(f"Successfully auto-progressed file {file_id} to DELIVERED stage")
     
     def check_sla_breaches(self) -> List[Dict]:
         """Check for files that have breached SLA and need escalation"""
@@ -1340,10 +1486,18 @@ class StageTrackingService:
             return pipeline
     
     def complete_stage_and_progress(self, file_id: str, employee_code: str, employee_name: str) -> Dict:
-        """Complete current stage and move file to next stage in sequence"""
+        """Complete current stage and move file to next stage in sequence.
+        
+        Stage auto-progression rules:
+          PRELIMS  → explicit transition to PRODUCTION (via this method)
+          PRODUCTION → auto-progresses to COMPLETED inside complete_stage()
+          COMPLETED → requires manager action to move to QC (no auto)
+          QC       → auto-progresses to DELIVERED inside complete_stage()
+          DELIVERED → terminal stage
+        """
         from app.models.stage_flow import FileStage
         
-        # Get current tracking
+        # Get current tracking before completing
         tracking = self.get_file_tracking(file_id)
         if not tracking:
             raise ValueError(f"No tracking found for file {file_id}")
@@ -1352,42 +1506,71 @@ class StageTrackingService:
             tracking = FileTracking(**tracking)
 
         previous_stage = tracking.current_stage
-        
-        # Complete current stage
+        if isinstance(previous_stage, str):
+            try:
+                previous_stage = FileStage(previous_stage)
+            except Exception:
+                previous_stage = FileStage.PRELIMS
+
+        # Complete current stage (this auto-progresses PRODUCTION→COMPLETED and QC→DELIVERED)
         self.complete_stage(file_id, employee_code)
-        
-        # Define stage progression sequence
-        stage_sequence = [FileStage.PRELIMS, FileStage.PRODUCTION, FileStage.QC, FileStage.COMPLETED]
-        
-        # Find current stage index
-        current_index = stage_sequence.index(previous_stage)
-        
-        # Move to next stage if not completed
-        if current_index < len(stage_sequence) - 1:
-            next_stage = stage_sequence[current_index + 1]
-            
-            # Transition to next stage
-            self.transition_to_next_stage(file_id, employee_code, next_stage)
-            
-            return {
-                "success": True,
-                "file_id": file_id,
-                "previous_stage": previous_stage,
-                "next_stage": next_stage,
-                "completed_by": employee_code,
-                "completed_by_name": employee_name,
-                "message": f"File {file_id} progressed from {previous_stage} to {next_stage}"
-            }
+
+        # For PRELIMS only: explicitly transition to PRODUCTION
+        # (PRODUCTION→COMPLETED and QC→DELIVERED are handled inside complete_stage)
+        if previous_stage == FileStage.PRELIMS:
+            try:
+                self.transition_to_next_stage(file_id, employee_code, FileStage.PRODUCTION)
+                next_stage = FileStage.PRODUCTION
+            except Exception as e:
+                logger.warning(f"[STAGE-PROGRESS] Could not transition {file_id} to PRODUCTION: {e}")
+                next_stage = FileStage.PRODUCTION
+        elif previous_stage == FileStage.PRODUCTION:
+            next_stage = FileStage.COMPLETED   # already done by complete_stage auto-progress
+        elif previous_stage == FileStage.QC:
+            next_stage = FileStage.DELIVERED   # already done by complete_stage auto-progress
         else:
-            return {
-                "success": True,
-                "file_id": file_id,
-                "previous_stage": previous_stage,
-                "next_stage": None,
-                "completed_by": employee_code,
-                "completed_by_name": employee_name,
-                "message": f"File {file_id} has completed all stages"
-            }
+            next_stage = None
+
+        # Always sync permit_files status to match the actual file_tracking stage
+        try:
+            ft_now = self.db[FILE_TRACKING_COLLECTION].find_one({"file_id": file_id}, {"current_stage": 1})
+            if ft_now:
+                real_stage = ft_now.get("current_stage", "PRELIMS")
+                stage_to_status = {
+                    "PRELIMS": "IN_PRELIMS",
+                    "PRODUCTION": "IN_PRODUCTION",
+                    "COMPLETED": "COMPLETED",
+                    "QC": "IN_QC",
+                    "DELIVERED": "DELIVERED",
+                }
+                real_status = stage_to_status.get(real_stage, "IN_PRELIMS")
+                self.db.permit_files.update_one(
+                    {"file_id": file_id},
+                    {
+                        "$set": {
+                            "current_stage": real_stage,
+                            "workflow_step": real_stage,
+                            "project_details.project_name": real_stage,
+                            "status": real_status,
+                            "acceptance.accepted_by": None,
+                            "acceptance.accepted_at": None,
+                            "updated_at": datetime.utcnow()
+                        }
+                    }
+                )
+                logger.info(f"[PERMIT-SYNC] Synced permit_files {file_id} → {real_stage} / {real_status}")
+        except Exception as ps_err:
+            logger.warning(f"[PERMIT-SYNC-WARN] Could not sync permit_files for {file_id}: {ps_err}")
+
+        return {
+            "success": True,
+            "file_id": file_id,
+            "previous_stage": previous_stage.value if hasattr(previous_stage, "value") else str(previous_stage),
+            "next_stage": next_stage.value if next_stage and hasattr(next_stage, "value") else str(next_stage) if next_stage else None,
+            "completed_by": employee_code,
+            "completed_by_name": employee_name,
+            "message": f"File {file_id} progressed from {previous_stage} to {next_stage}" if next_stage else f"File {file_id} has completed all stages"
+        }
     
     def get_files_ready_for_stage(self, stage: FileStage) -> List[Dict]:
         """Get files that are ready to be assigned to a specific stage"""
