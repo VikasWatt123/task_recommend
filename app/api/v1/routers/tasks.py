@@ -11,8 +11,6 @@ import sys
 import os
 import asyncio
 
-# Add temporal_workflows to path
-sys.path.append('/home/user/smart_task_assignee/task_recommend/temporal_workflows')
 from app.db.mongodb import get_db
 from app.db.mysql import mysql_service
 

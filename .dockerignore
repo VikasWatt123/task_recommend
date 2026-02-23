@@ -1,0 +1,71 @@
+# ======================
+# Git
+# ======================
+.git
+.gitignore
+
+# ======================
+# Python
+# ======================
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# ======================
+# IDE
+# ======================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ======================
+# Docker
+# ======================
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# ======================
+# Logs
+# ======================
+logs/
+*.log
+
+# ======================
+# Testing
+# ======================
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ======================
+# Frontend
+# ======================
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+
+# ======================
+# Node
+# ======================
+node_modules/
+
+# ======================
+# OS
+# ======================
+.DS_Store
+Thumbs.db
+
+# ======================
+# Temp
+# ======================
+*.tmp
+*.temp
+test_stage.py
+test_stage_local.py
