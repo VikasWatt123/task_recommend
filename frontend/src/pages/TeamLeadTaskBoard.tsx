@@ -1,14 +1,29 @@
-import { KanbanSquare, Users, FileText, CheckCircle, Clock, AlertCircle, Loader2, RefreshCw, ChevronDown, ChevronUp } from "lucide-react";
+import { 
+  KanbanSquare, 
+  Users, 
+  FileText, 
+  CheckCircle, 
+  CheckCircle2,
+  Clock, 
+  AlertCircle, 
+  Loader2, 
+  RefreshCw, 
+  ChevronDown, 
+  ChevronUp,
+  User,
+  Calendar,
+  Target
+} from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { cn } from "@/lib/utils";
-import { getTeamLeadTaskStats, getPermitFileTracking, completeTask } from "@/lib/api";
-import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
+import { useNavigate } from "react-router-dom";
+import { useState, useEffect } from "react";
+import { getTeamLeadTaskStats, getPermitFileTracking, completeTask } from "@/lib/api";
+import { getFileId, getFileDisplayName } from "@/utils/taskHelpers";
 
 // Helper function to format dates with proper timezone handling
 const formatDate = (dateString: string | undefined | null): string => {
@@ -75,7 +90,8 @@ interface TeamLeadStats {
 }
 
 interface PermitFile {
-  permit_file_id: string;
+  file_id: string;
+  permit_file_id?: string; // Backward compatibility
   file_name?: string;
   total_tasks: number;
   completed_tasks: number;
@@ -124,13 +140,25 @@ export default function TeamLeadTaskBoard() {
         getPermitFileTracking()
       ]);
       
-      // Ensure we always have arrays, even if API fails or returns unexpected data
-      setTeamStats((teamData?.team_stats || []) as TeamLeadStats[]);
-      setPermitFiles((permitData?.data || []) as PermitFile[]);  // Changed from permit_files to data
+      // Backend returns team_lead_stats (not team_stats), flatten task_statistics into each item
+      const rawStats = (teamData as any)?.team_lead_stats || (teamData as any)?.team_stats || [];
+      const mappedStats: TeamLeadStats[] = rawStats.map((item: any) => ({
+        team_lead_code: item.team_lead_code,
+        team_lead_name: item.team_lead_name,
+        total_tasks: item.task_statistics?.total_tasks ?? item.total_tasks ?? 0,
+        completed_tasks: item.task_statistics?.completed_tasks ?? item.completed_tasks ?? 0,
+        in_progress_tasks: item.task_statistics?.pending_tasks ?? item.in_progress_tasks ?? 0,
+        assigned_tasks: item.task_statistics?.total_tasks ?? item.assigned_tasks ?? 0,
+        completion_rate: item.task_statistics?.completion_rate ?? item.completion_rate ?? 0,
+        unique_employees: item.total_employees ?? item.unique_employees ?? 0,
+        employees: item.employees || [],
+      }));
+      setTeamStats(mappedStats);
+      setPermitFiles((permitData?.data || []) as PermitFile[]);
       setLastRefresh(new Date());
 
       if (isDebugEnabled) {
-        console.log(`Loaded ${teamData?.total_teams || 0} teams and ${permitData?.total_permit_files || 0} permit files`);
+        console.log(`Loaded ${mappedStats.length} teams and ${permitData?.total_permit_files || 0} permit files`);
       }
     } catch (error) {
       console.error('Error loading team lead data:', error);
@@ -412,11 +440,20 @@ export default function TeamLeadTaskBoard() {
                 </CardContent>
               </Card>
             ) : (
-              permitFiles?.map((permitFile) => (
-                <Card key={permitFile.permit_file_id}>
+              permitFiles?.map((permitFile) => {
+                const fileId = getFileId(permitFile) || '';
+                const uniqueKey = `permit-${fileId}-teamlead`;
+                
+                // Debug logging to track key usage
+                if (process.env.NODE_ENV === 'development') {
+                  console.log(`TeamLeadTaskBoard rendering key: ${uniqueKey} for file: ${fileId}`);
+                }
+                
+                return (
+                  <Card key={uniqueKey}>
                   <Collapsible
-                    open={expandedFiles.has(permitFile.permit_file_id)}
-                    onOpenChange={() => toggleFileExpansion(permitFile.permit_file_id)}
+                    open={expandedFiles.has(fileId)}
+                    onOpenChange={() => toggleFileExpansion(fileId)}
                   >
                     <CollapsibleTrigger asChild>
                       <CardHeader className="cursor-pointer hover:bg-muted/50 transition-colors">
@@ -424,7 +461,7 @@ export default function TeamLeadTaskBoard() {
                           <div className="flex items-center gap-3">
                             <FileText className="h-5 w-5 text-primary" />
                             <div>
-                              <CardTitle className="text-lg">Permit File: {permitFile.file_name || permitFile.permit_file_id}</CardTitle>
+                              <CardTitle className="text-lg">Permit File: {getFileDisplayName(permitFile)}</CardTitle>
                               <p className="text-sm text-muted-foreground">
                                 Status: {permitFile.status}
                               </p>
@@ -457,7 +494,7 @@ export default function TeamLeadTaskBoard() {
                               {getStatusIcon(permitFile.status)}
                               <span className="ml-1">{permitFile.status}</span>
                             </Badge>
-                            {expandedFiles.has(permitFile.permit_file_id) ? (
+                            {expandedFiles.has(fileId) ? (
                               <ChevronUp key="up" className="h-4 w-4" />
                             ) : (
                               <ChevronDown key="down" className="h-4 w-4" />
@@ -516,7 +553,8 @@ export default function TeamLeadTaskBoard() {
                     </CollapsibleContent>
                   </Collapsible>
                 </Card>
-              ))
+                );
+              })
             )}
           </TabsContent>
         </Tabs>

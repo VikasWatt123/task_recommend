@@ -105,6 +105,8 @@ export interface PermitFile {
   current_assignment?: {
     employee_code: string;
     employee_name: string;
+    assigned_at: string;
+    stage: string;
     started_at?: string;
   };
   metadata?: {
@@ -125,6 +127,7 @@ export interface PermitFile {
     project_name: string;
   };
   assigned_to_lead?: string;
+  /** @deprecated Use current_assignment instead */
   assignment?: {
     assigned_to: string;
     assigned_at: string;
@@ -210,6 +213,7 @@ export interface Task {
   time_assigned: string;
   date_assigned: string;
   assigned_by: string;
+  assigned_to?: string; // Standardized assigned employee field
   task_id: string;
   created_at: string;
   updated_at: string;
@@ -217,12 +221,22 @@ export interface Task {
   completed_at?: string; // Alternative completion time field
   completion_notes?: string; // Optional completion notes
   hours_taken?: number; // Hours taken to complete
+  // New dual-flow tracking fields
+  file_id?: string; // Primary file identifier
+  tracking_mode?: 'FILE_BASED' | 'STANDALONE'; // Task tracking mode
+  stage?: string; // Current stage for file-based tasks
   // Enhanced fields from permit file integration
+  /** @deprecated Use file_id instead */
   permit_file_id?: string;
   client_name?: string;
   project_name?: string;
   original_filename?: string;
   skills_required?: string[];
+  // Backward compatibility
+  source?: {
+    file_id?: string;
+    permit_file_id?: string;
+  };
 }
 
 export interface TaskAssignment {

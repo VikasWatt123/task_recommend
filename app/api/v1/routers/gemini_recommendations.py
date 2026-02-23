@@ -12,8 +12,10 @@ router = APIRouter(prefix="/task", tags=["task-recommendations"])
 class TaskRecommendationRequest(BaseModel):
     task_description: str
     top_k: Optional[int] = 10
-    min_similarity: Optional[float] = 0.5  # Increased from 0.3 to 0.5 for better matching
+    min_similarity: Optional[float] = 0.5
+    permit_file_id: Optional[str] = None
     file_id: Optional[str] = None
+    address: Optional[str] = None
     priority: Optional[str] = None
     required_skills: Optional[List[str]] = None
     filter_by_availability: Optional[bool] = True
@@ -47,24 +49,68 @@ async def get_task_recommendations(request: TaskRecommendationRequest) -> Recomm
     try:
         engine = get_recommendation_engine()
         
+        effective_permit_file_id = request.permit_file_id or request.file_id
+
         # Prepare additional context
         additional_context = {}
-        if request.file_id:
-            additional_context['file_id'] = request.file_id
+        if effective_permit_file_id:
+            additional_context['file_id'] = effective_permit_file_id
         if request.priority:
             additional_context['priority'] = request.priority
         if request.required_skills:
             additional_context['required_skills'] = request.required_skills
+        
+        current_file_stage = None
+        actual_team_lead_code = request.team_lead_code
+        actual_team_lead_name = None
+        resolved_zip = None
+        location_source = None
+        
+        # Handle address input (NEW)
+        if request.address and not effective_permit_file_id:
+            from app.api.v1.routers.permit_files import _extract_zip_from_address, _validate_zip_and_get_state, _choose_team_lead_for_state, _extract_team_lead_code
+            resolved_zip = _extract_zip_from_address(request.address)
+            if resolved_zip:
+                state_code = _validate_zip_and_get_state(resolved_zip)
+                if state_code:
+                    team_lead = _choose_team_lead_for_state(state_code)
+                    actual_team_lead_code = team_lead  # Pass FULL name, not just code
+                    actual_team_lead_name = team_lead
+                    location_source = "address_input"
+        
+        # Handle permit_file_id (existing logic)
+        elif effective_permit_file_id:
+            try:
+                from app.services.stage_tracking_service import get_stage_tracking_service
+
+                stage_service = get_stage_tracking_service()
+                tracking = stage_service.get_file_tracking(effective_permit_file_id)
+                if tracking and hasattr(tracking, "current_stage"):
+                    current_file_stage = tracking.current_stage.value
+            except Exception as e:
+                current_file_stage = None
+
+            # Auto-detect team lead from file if not provided
+            if not actual_team_lead_code:
+                actual_team_lead_code = engine._get_team_lead_from_file(effective_permit_file_id)
+                if actual_team_lead_code:
+                    actual_team_lead_name = engine._extract_team_lead_code(actual_team_lead_code)
+                    location_source = "permit_file"
         
         # Get optimized recommendations
         recommendations = engine.get_recommendations(
             task_description=request.task_description,
             top_k=request.top_k,
             min_score=request.min_similarity,
-            team_lead_code=request.team_lead_code
+            team_lead_code=actual_team_lead_code,
+            file_id=effective_permit_file_id,
+            current_file_stage=current_file_stage,
         )
         
         processing_time = round((time.time() - start_time) * 1000, 2)  # in milliseconds
+        
+        # Import the function for response formatting
+        from app.api.v1.routers.permit_files import _extract_team_lead_code
         
         return RecommendationResponse(
             recommendations=recommendations,
@@ -74,7 +120,12 @@ async def get_task_recommendations(request: TaskRecommendationRequest) -> Recomm
                 "top_k": request.top_k,
                 "min_similarity": request.min_similarity,
                 "filter_by_availability": request.filter_by_availability,
-                "team_lead_code": request.team_lead_code,
+                "team_lead_code": _extract_team_lead_code(actual_team_lead_code) if actual_team_lead_code else None,
+                "team_lead_name": actual_team_lead_name,
+                "location_source": location_source,
+                "resolved_zip": resolved_zip,
+                "location_filter_applied": bool(actual_team_lead_code),
+                "file_id": effective_permit_file_id,
                 "embedding_model": "text-embedding-004 (Vertex AI Gemini)",
                 "processing_time_ms": processing_time,
                 "optimization": "parallel_execution + caching + vectorized_computation"

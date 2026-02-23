@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -25,6 +25,7 @@ import {
   BarChart3
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { getFileId, getFileDisplayName, isStandaloneTask } from '@/utils/taskHelpers';
 import { 
   Employee, 
   PerformanceData, 
@@ -49,7 +50,9 @@ type EmployeeTaskApiItem = {
   completed_at?: string;
   date_assigned?: string;
   hours_taken?: number;
-  permit_file_id?: string;
+  file_id?: string;
+  permit_file_id?: string; // Backward compatibility
+  tracking_mode?: 'FILE_BASED' | 'STANDALONE';
   client_name?: string;
   project_name?: string;
   original_filename?: string;
@@ -792,8 +795,15 @@ const EnhancedEmployeePerformanceDashboard: React.FC = () => {
                                     )}
                                   </div>
                                 )}
-                                {task.permit_file_id && (
-                                  <p className="text-xs text-blue-600 mt-1">File ID: {task.permit_file_id}</p>
+                                {!isStandaloneTask(task) && (
+                                  <p className="text-xs text-blue-600 mt-1">
+                                    {getFileDisplayName(task)}
+                                  </p>
+                                )}
+                                {task.tracking_mode && (
+                                  <Badge variant="outline" className="text-xs mt-1">
+                                    {task.tracking_mode === 'FILE_BASED' ? 'File-Based' : 'Standalone'}
+                                  </Badge>
                                 )}
                               </div>
                               <Badge variant={performance.variant} className="ml-4">

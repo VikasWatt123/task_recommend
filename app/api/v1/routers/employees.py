@@ -6,6 +6,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 import math
+import logging
 from datetime import datetime
 from app.db.mongodb import get_db
 
@@ -21,6 +22,25 @@ def clean_nan_values(obj):
         return None
     else:
         return obj
+
+def get_employee_field(employee: dict, old_field: str, new_field: str):
+    """Helper function to get field value with backward compatibility"""
+    # Try new field first (MySQL-aligned), then fall back to old field
+    return employee.get(new_field) or employee.get(old_field)
+
+def find_employee_by_code(db, employee_code: str):
+    """Helper function to find employee by code with backward compatibility"""
+    # Try new field first (kekaemployeenumber), then fall back to old field
+    employee = db.employee.find_one({"kekaemployeenumber": employee_code})
+    if not employee:
+        employee = db.employee.find_one({"employee_code": employee_code})
+    return employee
+
+def update_employee_fields(update_data: dict, old_field: str, new_field: str, value):
+    """Helper function to update both old and new fields for backward compatibility"""
+    if value is not None:
+        update_data[new_field] = value
+        update_data[old_field] = value
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 security = HTTPBearer()
@@ -52,8 +72,8 @@ async def register_new_employee(employee_data: dict, db = Depends(get_db)):
     """Register a new employee and assign them to a team"""
     
     try:
-        # Check if employee already exists
-        existing_employee = db.employee.find_one({"employee_code": employee_data.get("employee_code")})
+        # Check if employee already exists (check both old and new fields)
+        existing_employee = find_employee_by_code(db, employee_data.get("employee_code"))
         if existing_employee:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -63,21 +83,27 @@ async def register_new_employee(employee_data: dict, db = Depends(get_db)):
         # Validate reporting manager exists
         manager_code = employee_data.get("reporting_manager")
         if manager_code:
-            manager = db.employee.find_one({"employee_code": manager_code})
+            manager = find_employee_by_code(db, manager_code)
             if not manager:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Reporting manager not found"
                 )
         
-        # Prepare employee document
+        # Prepare employee document with both old and new fields
         new_employee = {
+            # New MySQL-aligned fields
+            "kekaemployeenumber": employee_data.get("employee_code"),
+            "fullname": employee_data.get("employee_name"),
+            "email": employee_data.get("contact_email"),
+            # Original fields (for backward compatibility)
             "employee_code": employee_data.get("employee_code"),
             "employee_name": employee_data.get("employee_name"),
+            "contact_email": employee_data.get("contact_email"),
+            # Other fields
             "current_role": employee_data.get("current_role"),
             "shift": employee_data.get("shift"),
             "experience_years": employee_data.get("experience_years", 0),
-            "contact_email": employee_data.get("contact_email"),
             "reporting_manager": employee_data.get("reporting_manager"),
             "raw_technical_skills": employee_data.get("raw_technical_skills", ""),
             "skills": employee_data.get("skills", {}),
@@ -114,7 +140,7 @@ async def register_new_employee(employee_data: dict, db = Depends(get_db)):
 async def get_my_profile(employee_code: str = Depends(get_current_employee), db = Depends(get_db)):
     """Get current employee's profile"""
     
-    employee = db.employee.find_one({"employee_code": employee_code})
+    employee = find_employee_by_code(db, employee_code)
     
     if not employee:
         raise HTTPException(
@@ -140,7 +166,7 @@ async def update_my_profile(
     """Update current employee's profile"""
     
     # Check if employee exists
-    employee = db.employee.find_one({"employee_code": employee_code})
+    employee = find_employee_by_code(db, employee_code)
     if not employee:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -150,9 +176,9 @@ async def update_my_profile(
     # Prepare update data
     update_data = {}
     
-    # Only update fields that are provided
+    # Only update fields that are provided (update both old and new fields)
     if profile_data.employee_name is not None:
-        update_data["employee_name"] = profile_data.employee_name
+        update_employee_fields(update_data, "employee_name", "fullname", profile_data.employee_name)
     
     if profile_data.current_role is not None:
         update_data["current_role"] = profile_data.current_role
@@ -170,7 +196,7 @@ async def update_my_profile(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid email format. Please include '@' in email address."
             )
-        update_data["contact_email"] = profile_data.contact_email
+        update_employee_fields(update_data, "contact_email", "email", profile_data.contact_email)
     
     if profile_data.raw_technical_skills is not None:
         update_data["raw_technical_skills"] = profile_data.raw_technical_skills
@@ -181,9 +207,12 @@ async def update_my_profile(
     new_manager = None  # Initialize to avoid undefined reference
     
     if new_reporting_manager is not None and new_reporting_manager != old_reporting_manager:
-        # Validate that the new reporting manager exists
+        # Validate that the new reporting manager exists (check both old and new fields)
         new_manager = db.employee.find_one({
-            "employee_code": new_reporting_manager,
+            "$or": [
+                {"kekaemployeenumber": new_reporting_manager},
+                {"employee_code": new_reporting_manager}
+            ],
             "current_role": {"$regex": "Team Lead|Lead|Manager", "$options": "i"}
         })
         
@@ -206,9 +235,12 @@ async def update_my_profile(
     # Add timestamp
     update_data["profile_updated_at"] = datetime.utcnow()
     
-    # Update the employee record
+    # Update the employee record (update both old and new fields for backward compatibility)
     result = db.employee.update_one(
-        {"employee_code": employee_code},
+        {"$or": [
+            {"kekaemployeenumber": employee_code},
+            {"employee_code": employee_code}
+        ]},
         {"$set": update_data}
     )
     
@@ -219,7 +251,7 @@ async def update_my_profile(
         )
     
     # Get updated employee data
-    updated_employee = db.employee.find_one({"employee_code": employee_code})
+    updated_employee = find_employee_by_code(db, employee_code)
     
     # Remove MongoDB ObjectId and other sensitive fields
     if updated_employee:
@@ -237,8 +269,8 @@ async def update_my_profile(
         response_data["team_change"] = {
             "old_manager": old_reporting_manager,
             "new_manager": new_reporting_manager,
-            "new_manager_name": new_manager.get("employee_name"),
-            "message": f"You have been moved to {new_manager.get('employee_name')}'s team"
+            "new_manager_name": get_employee_field(new_manager, "employee_name", "fullname"),
+            "message": f"You have been dealt to {get_employee_field(new_manager, 'employee_name', 'fullname')}'s team"
         }
     
     return response_data
@@ -252,7 +284,7 @@ async def update_technical_skills(
     """Update employee's technical skills"""
     
     # Check if employee exists
-    employee = db.employee.find_one({"employee_code": employee_code})
+    employee = find_employee_by_code(db, employee_code)
     if not employee:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -281,9 +313,12 @@ async def update_technical_skills(
     # Add timestamp
     skills_update["skills_updated_at"] = datetime.utcnow()
     
-    # Update the employee record
+    # Update the employee record (update both old and new fields for backward compatibility)
     result = db.employee.update_one(
-        {"employee_code": employee_code},
+        {"$or": [
+            {"kekaemployeenumber": employee_code},
+            {"employee_code": employee_code}
+        ]},
         {"$set": skills_update}
     )
     
@@ -294,7 +329,7 @@ async def update_technical_skills(
         )
     
     # Get updated employee data
-    updated_employee = db.employee.find_one({"employee_code": employee_code})
+    updated_employee = find_employee_by_code(db, employee_code)
     
     return {
         "success": True,
@@ -314,7 +349,9 @@ async def get_available_managers(db = Depends(get_db)):
         {
             "_id": 0,
             "employee_code": 1,
+            "kekaemployeenumber": 1,
             "employee_name": 1,
+            "fullname": 1,
             "current_role": 1,
             "reporting_manager": 1
         }
@@ -532,44 +569,91 @@ async def get_employees() -> List[Dict[str, Any]]:
 
 @router.get("/employees-grouped-by-team-lead")
 async def get_employees_grouped_by_team_lead():
-    """Get employees grouped by team lead from MongoDB"""
-    db = get_db()
-    employees = list(db.employee.find({}, {"_id": 0}))
+    """Get employees grouped by team lead from MongoDB - optimized version"""
+    logger = logging.getLogger(__name__)
+    logger.info("[EMPLOYEES-GROUPED-MAIN-START] Fetching employees grouped by team lead (main router)")
     
-    # Group employees by reporting manager
-    teams = {}
-    for emp in employees:
-        manager_code = emp.get("reporting_manager", "")
-        manager_name = ""
+    try:
+        db = get_db()
         
-        # Try to find manager name if code exists
-        if manager_code and manager_code != "":
-            # Find manager in employee list
-            for manager in employees:
-                if manager.get("employee_code") == manager_code:
-                    manager_name = manager.get("employee_name", "Unknown Lead")
-                    break
-        
-        if manager_code not in teams:
-            teams[manager_code] = {
-                "team_lead_code": manager_code,
-                "team_lead_name": manager_name,
-                "employees": []
+        # Optimized query with timeout and field projection
+        employees = list(db.employee.find(
+            {"status_1": "Permanent"},
+            {
+                "_id": 0,
+                "employee_code": 1,
+                "employee_name": 1,
+                "reporting_manager": 1,
+                "current_role": 1,
+                "experience_years": 1,
+                "contact_email": 1,
+                "status_1": 1,
+                "technical_skills": 1
             }
+        ).max_time_ms(10000).limit(100))
         
-        # Add employee to team
-        teams[manager_code]["employees"].append({
-            "employee_code": emp.get("employee_code"),
-            "employee_name": emp.get("employee_name"),
-            "current_role": emp.get("current_role"),
-            "experience_years": emp.get("experience_years", 0),
-            "skills": emp.get("skills", {}),
-            "status": emp.get("status_1", ""),
-            "contact_email": emp.get("contact_email")
-        })
-    
-    # Clean any NaN values
-    return clean_nan_values(list(teams.values()))
+        logger.info(f"[EMPLOYEES-GROUPED-MAIN-SUCCESS] Retrieved {len(employees)} employees")
+        
+        if not employees:
+            return []
+        
+        # Group by reporting manager with uniform parsing
+        teams = {}
+        team_lead_cache = {}
+        
+        for emp in employees:
+            manager = emp.get("reporting_manager", "Unassigned")
+            
+            # Parse reporting_manager uniformly: "Name (Code)" -> extract name and code
+            team_lead_code = manager
+            team_lead_name = manager
+            
+            if manager and manager != "Unassigned" and "(" in manager and ")" in manager:
+                import re
+                match = re.match(r"(.+?)\s*\(([^)]+)\)", manager.strip())
+                if match:
+                    team_lead_name = match.group(1).strip()
+                    team_lead_code = match.group(2).strip()
+            
+            # Cache team lead info to avoid repeated parsing
+            if team_lead_code not in team_lead_cache:
+                team_lead_cache[team_lead_code] = {
+                    "team_lead_name": team_lead_name,
+                    "team_lead_code": team_lead_code
+                }
+            
+            # Initialize team if not exists
+            if team_lead_code not in teams:
+                lead_info = team_lead_cache[team_lead_code]
+                teams[team_lead_code] = {
+                    "team_lead_code": lead_info["team_lead_code"],
+                    "team_lead_name": lead_info["team_lead_name"],
+                    "employees": []
+                }
+            
+            # Add employee to team with consistent fields
+            teams[team_lead_code]["employees"].append({
+                "employee_code": emp.get("employee_code"),
+                "employee_name": emp.get("employee_name"),
+                "current_role": emp.get("current_role"),
+                "experience_years": emp.get("experience_years", 0),
+                "skills": emp.get("technical_skills", {}),  # Use technical_skills instead of skills
+                "status": emp.get("status_1", ""),
+                "contact_email": emp.get("contact_email")
+            })
+        
+        # Convert to list and sort
+        result = list(teams.values())
+        result.sort(key=lambda x: x["team_lead_name"])
+        
+        logger.info(f"[EMPLOYEES-GROUPED-MAIN-SUCCESS] Returning {len(result)} teams")
+        
+        return clean_nan_values(result)
+        
+    except Exception as e:
+        logger.error(f"[EMPLOYEES-GROUPED-MAIN-ERROR] Failed to fetch employees: {str(e)}")
+        # Return empty list instead of crashing
+        return []
 
 @router.get("/{employee_code}")
 async def get_employee(employee_code: str):

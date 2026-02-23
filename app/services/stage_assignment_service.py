@@ -178,29 +178,13 @@ class StageAssignmentService:
             if file_tracking and file_tracking.get('current_stage') == 'COMPLETED':
                 file_is_completed = True
         
-        # If file is COMPLETED, prioritize QC stage
+        # If file is COMPLETED, do not auto-assign to QC stage
+        # Manager must manually move file to QC stage first
         if file_is_completed:
-            description_lower = task_description.lower()
-            
-            # Check for QC-specific keywords
-            qc_keywords = ["quality", "analytics", "analysis", "review", "inspection",
-                          "testing", "audit", "check", "verification", "validation",
-                          "quality control", "quality assurance", "qa", "qc"]
-            
-            qc_matches = sum(1 for keyword in qc_keywords if keyword in description_lower)
-            
-            if qc_matches > 0:
-                logger.info(f"File is COMPLETED, assigning to QC stage (QC keywords found: {qc_matches})")
-                return FileStage.QC
-            else:
-                # For COMPLETED files without explicit QC keywords, 
-                # production keywords still indicate QC review work
-                production_keywords = StageAssignmentService.STAGE_KEYWORDS[FileStage.PRODUCTION]
-                production_matches = sum(1 for keyword in production_keywords if keyword in description_lower)
-                
-                if production_matches > 0:
-                    logger.info(f"File is COMPLETED, assigning to QC stage (Production keywords indicate QC review: {production_matches})")
-                    return FileStage.QC
+            logger.info(f"File is COMPLETED. Stage detection disabled - manager must move file to QC stage before assigning QC tasks")
+            # Return None to indicate no stage should be auto-assigned
+            # The task assignment logic will handle this appropriately
+            return None
         
         return detected_stage
     
@@ -290,16 +274,29 @@ class StageAssignmentService:
         
         # Check stage flow rules
         if requested_stage == FileStage.PRODUCTION:
-            if current_stage != FileStage.PRELIMS:
-                return False, "File must complete PRELIMS stage before moving to PRODUCTION"
+            # Allow PRODUCTION tasks if file is in PRELIMS (progressing) OR already in PRODUCTION
+            if current_stage not in [FileStage.PRELIMS, FileStage.PRODUCTION]:
+                return False, f"File must be in PRELIMS or PRODUCTION stage to create PRODUCTION tasks. Current stage: {current_stage.value if current_stage else 'None'}"
                 
         elif requested_stage == FileStage.QC:
-            if current_stage != FileStage.COMPLETED:
-                return False, "File must complete PRODUCTION stage (and be in COMPLETED) before moving to QUALITY"
+            if current_stage != FileStage.QC and current_stage != FileStage.COMPLETED:
+                return False, f"File must be in QC or COMPLETED stage to create QC tasks. Current stage: {current_stage.value if current_stage else 'None'}"
                 
         elif requested_stage == FileStage.DELIVERED:
             if current_stage != FileStage.QC:
-                return False, "File must complete QUALITY stage before being DELIVERED"
+                return False, f"File must complete QUALITY stage before being delievered. Current stage: {current_stage.value if current_stage else 'None'}"
+        
+        # Also check if trying to create tasks for earlier stages
+        elif requested_stage == FileStage.PRELIMS:
+            if current_stage and current_stage != FileStage.PRELIMS:
+                return False, f"File has already progressed past PRELIMS stage (currently in {current_stage.value}). Cannot create PRELIMS tasks."
+            # Even if still at PRELIMS stage, block if a PRELIMS task already exists for this file
+            existing_prelims = db.tasks.find_one({
+                "$or": [{"file_id": file_id}, {"source.permit_file_id": file_id}],
+                "stage": "PRELIMS"
+            })
+            if existing_prelims:
+                return False, f"File {file_id} already has a PRELIMS task ({existing_prelims.get('task_id')}). Cannot create duplicate PRELIMS tasks."
         
         return True, None
     

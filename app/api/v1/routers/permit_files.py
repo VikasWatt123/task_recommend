@@ -13,17 +13,209 @@ import hashlib
 import logging
 
 from pypdf import PdfReader
+from app.services.file_deduplication_service import FileDeduplicationService
+from app.services.stage_tracking_service import get_stage_tracking_service
+from app.models.stage_flow import FileStage
+
+# ZIP extraction utilities (copied from zip_assign.py)
+def _normalize_extracted_text(text: str) -> str:
+    if not text:
+        return ""
+    # Remove common invisible separators that break regex matching
+    text = text.replace("\u200b", " ")  # zero width space
+    text = text.replace("\u200c", " ")
+    text = text.replace("\u200d", " ")
+    text = text.replace("\ufeff", " ")
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def _extract_zip_candidates(text: str) -> List[str]:
+    """Return candidate 5-digit ZIPs found in text (best-effort)."""
+    if not text:
+        return []
+
+    candidates: List[str] = []
+
+    # Pattern: "LA 71303" / "LA-71303" / "LA:71303" / "LA, 71303" and ZIP+4.
+    for m in re.finditer(r"\b[A-Z]{2}\s*[-,:]?\s*(\d{5})(?:-\d{4})?\b", text, flags=re.IGNORECASE):
+        candidates.append(m.group(1))
+
+    # Pattern: standalone ZIP or ZIP+4
+    for m in re.finditer(r"\b(\d{5})(?:-\d{4})?\b", text):
+        candidates.append(m.group(1))
+
+    # Pattern: spaced digits e.g. "7 1 3 0 3" or "7-1-3-0-3"
+    for m in re.finditer(r"(?<!\d)(\d(?:[\s\-]{1,3}\d){4})(?!\d)", text):
+        compact = re.sub(r"[\s\-]+", "", m.group(1))
+        if len(compact) == 5 and compact.isdigit():
+            candidates.append(compact)
+
+    # De-dupe while preserving order
+    seen = set()
+    ordered: List[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+def _extract_zip_from_pdf_first_page(pdf_bytes: bytes) -> Optional[str]:
+    """Extract first 5-digit ZIP code from PDF first 3 pages."""
+    if not pdf_bytes:
+        return None
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if not reader.pages:
+            return None
+        
+        # Extract text from first 3 pages (or fewer if PDF has less pages)
+        all_text = ""
+        max_pages = min(3, len(reader.pages))
+        
+        for i in range(max_pages):
+            page = reader.pages[i]
+            # Try default extraction; if empty, try layout mode
+            page_text = (page.extract_text() or "").strip()
+            if not page_text:
+                try:
+                    page_text = (page.extract_text(extraction_mode="layout") or "").strip()
+                except TypeError:
+                    # Older pypdf versions may not support extraction_mode
+                    pass
+            all_text += page_text + " "
+            
+            # If we found a ZIP in current page, no need to check more pages
+            if page_text:
+                normalized = _normalize_extracted_text(page_text)
+                candidates = _extract_zip_candidates(normalized)
+                if candidates:
+                    zip_code = candidates[0]
+                    logger.info(f"[UPLOAD] Extracted ZIP from page {i+1}: {zip_code}")
+                    return zip_code
+        
+        # If no ZIP found in individual pages, try searching all pages combined
+        normalized = _normalize_extracted_text(all_text)
+        logger.info(f"[UPLOAD] Combined text from {max_pages} pages length: {len(normalized)}")
+        
+        candidates = _extract_zip_candidates(normalized)
+        logger.info(f"[UPLOAD] ZIP candidates found: {candidates}")
+        if not candidates:
+            logger.warning("[UPLOAD] No ZIP candidates found in extracted text")
+            return None
+
+        zip_code = candidates[0]
+        logger.info(f"[UPLOAD] Extracted ZIP from combined pages: {zip_code}")
+        return zip_code
+        
+    except Exception as e:
+        logger.error(f"[UPLOAD] PDF parsing failed: {e}")
+        return None
+
+# State to ZIP range mapping (copied from zip_assign.py)
+US_STATE_ZIP_RANGES: Dict[str, Dict[str, str]] = {
+    "massachusetts": {"code": "MA", "zip_min": "01001", "zip_max": "05544"},
+    "rhode island": {"code": "RI", "zip_min": "02801", "zip_max": "02940"},
+    "florida": {"code": "FL", "zip_min": "32003", "zip_max": "34997"},
+    "georgia": {"code": "GA", "zip_min": "30002", "zip_max": "39901"},
+    "oregon": {"code": "OR", "zip_min": "97001", "zip_max": "97920"},
+    "washington": {"code": "WA", "zip_min": "98001", "zip_max": "99403"},
+    "arizona": {"code": "AZ", "zip_min": "85001", "zip_max": "86556"},
+    "connecticut": {"code": "CT", "zip_min": "06001", "zip_max": "06928"},
+    "utah": {"code": "UT", "zip_min": "84001", "zip_max": "84791"},
+    "louisiana": {"code": "LA", "zip_min": "70001", "zip_max": "71497"},
+    "illinois": {"code": "IL", "zip_min": "60001", "zip_max": "62999"},
+    "texas": {"code": "TX", "zip_min": "73301", "zip_max": "88595"},
+    "california": {"code": "CA", "zip_min": "90001", "zip_max": "96162"},
+    "pennsylvania": {"code": "PA", "zip_min": "15001", "zip_max": "19640"},
+    "maryland": {"code": "MD", "zip_min": "20601", "zip_max": "21930"},
+}
+
+# Team lead to state mapping (copied from zip_assign.py)
+TEAM_LEAD_STATE_MAP: Dict[str, List[str]] = {
+    "MA": ["Rahul (0081)", "Tanweer Alam (0067)"],
+    "RI": ["Rahul (0081)"],
+    "FL": ["Gaurav Mavi (0146)"],
+    "GA": ["Gaurav Mavi (0146)"],
+    "OR": ["Gaurav Mavi (0146)"],
+    "WA": ["Gaurav Mavi (0146)"],
+    "COMMERCIAL": ["Harish (0644)"],
+    "AZ": ["Prashant Sharma (0079)", "Shivam Kumar (0083)", "Rohan Kashid (0902)"],
+    "CT": ["Prashant Sharma (0079)"],
+    "UT": ["Prashant Sharma (0079)"],
+    "LA": ["Prashant Sharma (0079)"],
+    "IL": ["Prashant Sharma (0079)"],
+    "TX": ["Saurav Yadav (0119)"],
+    "CA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)"],
+    "PA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)", "Tanweer Alam (0067)"],
+    "MD": ["Tanweer Alam (0067)"],
+}
+
+def _validate_zip_and_get_state(zip_code: str) -> Optional[str]:
+    """Validate ZIP and return state code if valid."""
+    zip_int = int(zip_code)
+    for state_name, info in US_STATE_ZIP_RANGES.items():
+        zip_min = int(info["zip_min"])
+        zip_max = int(info["zip_max"])
+        if zip_min <= zip_int <= zip_max:
+            state_code = info["code"]
+            logger.info(f"[UPLOAD] ZIP {zip_code} -> state {state_code} ({state_name})")
+            return state_code
+    logger.warning(f"[UPLOAD] ZIP {zip_code} does not fall in any state range")
+    return None
+
+def _choose_team_lead_for_state(state_code: str) -> Optional[str]:
+    """Choose team lead for a state."""
+    candidates = TEAM_LEAD_STATE_MAP.get(state_code) or []
+    if not candidates:
+        logger.warning(f"[UPLOAD] No team lead found for state: {state_code}")
+        return None
+    # For now, pick first candidate (deterministic by load can be added later)
+    chosen = candidates[0]
+    logger.info(f"[UPLOAD] Chosen team lead for {state_code}: {chosen}")
+    return chosen
+
+def _extract_team_lead_code(team_lead: str) -> Optional[str]:
+    """Extract team lead code from name string."""
+    if not team_lead:
+        return None
+    match = re.search(r"\(([^)]+)\)", team_lead)
+    return match.group(1).strip() if match else None
+
+def _extract_zip_from_address(address: str) -> Optional[str]:
+    """Extract 5-digit ZIP code from address string."""
+    if not address:
+        return None
+    
+    # Normalize address
+    address = address.strip()
+    
+    # Pattern 1: 5-digit ZIP at end (most common)
+    match = re.search(r'\b(\d{5})(?:-\d{4})?\s*$', address)
+    if match:
+        return match.group(1)
+    
+    # Pattern 2: ZIP after state abbreviation
+    match = re.search(r'\b[A-Z]{2}\s*[,]?\s*(\d{5})(?:-\d{4})?\b', address, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    # Pattern 3: Any 5-digit number in address (fallback)
+    match = re.search(r'\b(\d{5})(?:-\d{4})?\b', address)
+    if match:
+        return match.group(1)
+    
+    return None
 
 from app.db.mongodb import get_db
 from app.core.settings import settings
-from app.models.stage_flow import FileStage
 from app.services.stage_tracking_service import get_stage_tracking_service
 from app.services.recommendation_engine import get_recommendation_engine
 from logging import getLogger
 
 logger = getLogger(__name__)
 logger.setLevel(logging.INFO)
-from app.api.v1.routers.tasks import TaskCreate, TaskAssign, create_task, assign_task
+from app.api.v1.routers.tasks import TaskCreate, TaskAssign, create_task
 
 router = APIRouter(prefix="/permit-files", tags=["permit_files"])
 
@@ -37,11 +229,20 @@ def generate_file_id():
 
 def _get_completed_stages(tracking):
     """Get list of completed stages for a file"""
-    if not tracking or not hasattr(tracking, 'stage_history'):
+    if not tracking:
         return []
-    
+
+    stage_history = None
+    if isinstance(tracking, dict):
+        stage_history = tracking.get('stage_history')
+    else:
+        stage_history = getattr(tracking, 'stage_history', None)
+
+    if not stage_history:
+        return []
+
     completed = []
-    for history_entry in tracking.stage_history:
+    for history_entry in stage_history:
         if isinstance(history_entry, dict):
             stage = history_entry.get("stage")
             status = history_entry.get("stage_status")
@@ -72,11 +273,20 @@ def _calculate_stage_duration(history_entry):
 
 def _calculate_total_time(tracking):
     """Calculate total time spent across all completed stages"""
-    if not tracking or not hasattr(tracking, 'stage_history'):
+    if not tracking:
         return 0
-    
+
+    stage_history = None
+    if isinstance(tracking, dict):
+        stage_history = tracking.get('stage_history')
+    else:
+        stage_history = getattr(tracking, 'stage_history', None)
+
+    if not stage_history:
+        return 0
+
     total_minutes = 0
-    for history_entry in tracking.stage_history:
+    for history_entry in stage_history:
         duration = _calculate_stage_duration(history_entry)
         if duration:
             total_minutes += duration
@@ -84,7 +294,7 @@ def _calculate_total_time(tracking):
 
 
 TEAM_LEAD_STATE_MAP: Dict[str, List[str]] = {
-    "MA": ["Rahul (0081)", "Tanveer Alam (0067)"],
+    "MA": ["Rahul (0081)", "Tanweer Alam (0067)"],
     "RI": ["Rahul (0081)"],
     "FL": ["Gaurav Mavi (0146)"],
     "GA": ["Gaurav Mavi (0146)"],
@@ -98,8 +308,8 @@ TEAM_LEAD_STATE_MAP: Dict[str, List[str]] = {
     "IL": ["Prashant Sharma (0079)"],
     "TX": ["Saurav Yadav (0119)"],
     "CA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)"],
-    "PA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)", "Tanveer Alam (0067)"],
-    "MD": ["Tanveer Alam (0067)"],
+    "PA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)", "Tanweer Alam (0067)"],
+    "MD": ["Tanweer Alam (0067)"],
 }
 
 
@@ -130,7 +340,7 @@ def _extract_team_lead_code(team_lead: str) -> Optional[str]:
 
 
 def _extract_state_from_pdf_first_page(pdf_bytes: bytes) -> Optional[str]:
-    """Extract US state code from ONLY the first page of a PDF using ZIP code fallback."""
+    """Extract US state code from the first 3 pages of a PDF using ZIP code fallback."""
 
     if not pdf_bytes:
         return None
@@ -139,18 +349,68 @@ def _extract_state_from_pdf_first_page(pdf_bytes: bytes) -> Optional[str]:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if not reader.pages:
             return None
-        text = (reader.pages[0].extract_text() or "").strip()
+        
+        # Extract text from first 3 pages (or fewer if PDF has less pages)
+        all_text = ""
+        max_pages = min(3, len(reader.pages))
+        
+        for i in range(max_pages):
+            page = reader.pages[i]
+            page_text = (page.extract_text() or "").strip()
+            all_text += page_text + " "
+            
+            # If we found state info in current page, no need to check more pages
+            if page_text:
+                # Check for commercial keyword
+                if re.search(r"\bcommercial\b", page_text, flags=re.IGNORECASE):
+                    logger.info(f"[STATE EXTRACTION] Detected COMMERCIAL keyword on page {i+1}")
+                    return "COMMERCIAL"
+                
+                # Try to extract ZIP codes
+                zip_matches = re.findall(r"\b(\d{5})\b", page_text)
+                if zip_matches:
+                    for zip_code in zip_matches:
+                        zip_int = int(zip_code)
+                        logger.info(f"[STATE EXTRACTION] Found ZIP on page {i+1}: {zip_code}")
+                        for state_name, info in US_STATE_NAME_TO_CODE.items():
+                            state_code, zip_min, zip_max = info
+                            if zip_min <= zip_int <= zip_max:
+                                logger.info(f"[STATE EXTRACTION] ZIP {zip_code} -> state {state_name} ({state_code})")
+                                return state_code
+                
+                # Check for state abbreviations
+                supported_codes = [
+                    "MA", "RI", "FL", "GA", "OR", "WA",
+                    "AZ", "CT", "UT", "LA", "IL", "TX", "CA", "PA", "MD",
+                ]
+                for code in supported_codes:
+                    if re.search(rf"\b{re.escape(code)}\b", page_text, flags=re.IGNORECASE):
+                        logger.info(f"[STATE EXTRACTION] Detected state code on page {i+1}: {code}")
+                        return code
+                
+                # Check for full state names
+                text_lower = page_text.lower()
+                for state_name, info in US_STATE_NAME_TO_CODE.items():
+                    if state_name in text_lower:
+                        state_code = info[0]
+                        logger.info(f"[STATE EXTRACTION] Detected state name on page {i+1}: {state_name} -> {state_code}")
+                        return state_code
+        
+        # If nothing found in individual pages, check all pages combined
+        logger.info(f"[STATE EXTRACTION] Checking combined text from {max_pages} pages")
+        text = all_text.strip()
+        
     except Exception:
         return None
 
     if not text:
         return None
 
-    logger.info(f"[STATE EXTRACTION] First page text preview: {text[:300]}...")
+    logger.info(f"[STATE EXTRACTION] Combined text preview: {text[:300]}...")
 
     # 1) Commercial keyword first
     if re.search(r"\bcommercial\b", text, flags=re.IGNORECASE):
-        logger.info("[STATE EXTRACTION] Detected COMMERCIAL keyword")
+        logger.info("[STATE EXTRACTION] Detected COMMERCIAL keyword in combined text")
         return "COMMERCIAL"
 
     # 2) Try to extract ZIP codes (5-digit) and map to state (highest priority)
@@ -158,7 +418,7 @@ def _extract_state_from_pdf_first_page(pdf_bytes: bytes) -> Optional[str]:
     if zip_matches:
         for zip_code in zip_matches:
             zip_int = int(zip_code)
-            logger.info(f"[STATE EXTRACTION] Found ZIP: {zip_code}")
+            logger.info(f"[STATE EXTRACTION] Found ZIP in combined text: {zip_code}")
             for state_name, info in US_STATE_NAME_TO_CODE.items():
                 state_code, zip_min, zip_max = info
                 if zip_min <= zip_int <= zip_max:
@@ -172,7 +432,7 @@ def _extract_state_from_pdf_first_page(pdf_bytes: bytes) -> Optional[str]:
     ]
     for code in supported_codes:
         if re.search(rf"\b{re.escape(code)}\b", text, flags=re.IGNORECASE):
-            logger.info(f"[STATE EXTRACTION] Detected state code: {code}")
+            logger.info(f"[STATE EXTRACTION] Detected state code in combined text: {code}")
             return code
 
     # 4) Fallback to full state names
@@ -180,10 +440,10 @@ def _extract_state_from_pdf_first_page(pdf_bytes: bytes) -> Optional[str]:
     for state_name, info in US_STATE_NAME_TO_CODE.items():
         if state_name in text_lower:
             state_code = info[0]
-            logger.info(f"[STATE EXTRACTION] Detected state name: {state_name} -> {state_code}")
+            logger.info(f"[STATE EXTRACTION] Detected state name in combined text: {state_name} -> {state_code}")
             return state_code
 
-    logger.warning(f"[STATE EXTRACTION] No state detected in first page text")
+    logger.warning(f"[STATE EXTRACTION] No state detected in first {max_pages} pages")
     return None
 
 
@@ -369,19 +629,61 @@ async def get_unassigned_permit_files():
     """Get permit files that haven't been assigned to specific employees yet"""
     db = get_db()
     
-    # Find files that are ready for assignment but don't have task assignments yet
-    # Files that are in initial stages and haven't been assigned to employees
+    # First, get all files that don't have tasks assigned
     unassigned_files = list(db.permit_files.find({
-        "status": {"$in": ["IN_PRELIMS", "IN_PRODUCTION", "IN_QC", "ACCEPTED"]},
         "$or": [
             {"tasks_created": {"$size": 0}},
             {"tasks_created": {"$exists": False}}
         ]
     }, {"_id": 0}))
     
+    # Get stage tracking for all files
+    file_ids = [f.get("file_id") for f in unassigned_files if f.get("file_id")]
+    tracking_map = {}
+    delivered_files = set()
+    
+    if file_ids:
+        try:
+            all_tracking = list(db.file_tracking.find(
+                {"file_id": {"$in": file_ids}}, 
+                {"_id": 0, "file_id": 1, "current_stage": 1, "current_status": 1}
+            ))
+            for t in all_tracking:
+                tracking_map[t["file_id"]] = t
+                # Mark delivered files to exclude them
+                if t.get("current_stage") == "DELIVERED" or t.get("current_status") == "DELIVERED":
+                    delivered_files.add(t["file_id"])
+        except Exception as e:
+            logger.warning(f"Failed to fetch stage tracking for unassigned files: {e}")
+    
+    # Filter files based on their actual stage and status
+    filtered_files = []
+    for file in unassigned_files:
+        file_id = file.get("file_id")
+        
+        # Skip delivered files
+        if file_id in delivered_files:
+            continue
+            
+        # Get actual stage from tracking
+        tracking = tracking_map.get(file_id, {})
+        actual_stage = tracking.get("current_stage", "PRELIMS")
+        
+        # Only include files that are in appropriate stages for assignment
+        # Files in DELIVERED stage should not be assignable
+        if actual_stage in ["PRELIMS", "PRODUCTION", "QC"]:
+            # Also check if the permit file status matches
+            file_status = file.get("status", "IN_PRELIMS")
+            
+            # Include if status is appropriate for the stage
+            if (actual_stage == "PRELIMS" and file_status in ["IN_PRELIMS", "ACCEPTED"]) or \
+               (actual_stage == "PRODUCTION" and file_status in ["IN_PRODUCTION"]) or \
+               (actual_stage == "QC" and file_status in ["IN_QC"]):
+                filtered_files.append(file)
+    
     # Transform files to match the same format as the main permit files endpoint
     transformed_files = []
-    for file in unassigned_files:
+    for file in filtered_files:
         transformed_file = file.copy()
         
         # Set file_name from original_filename (same as main endpoint)
@@ -402,8 +704,13 @@ async def get_unassigned_permit_files():
         if "workflow_step" in file:
             transformed_file["workflow_step"] = file["workflow_step"]
         
-        # Set current_stage from workflow_step for frontend compatibility
-        transformed_file["current_stage"] = file.get("workflow_step", "PRELIMS")
+        # Set current_stage from actual tracking, fallback to workflow_step
+        file_id = file.get("file_id")
+        if file_id and file_id in tracking_map:
+            tracking = tracking_map[file_id]
+            transformed_file["current_stage"] = tracking.get("current_stage", "PRELIMS")
+        else:
+            transformed_file["current_stage"] = file.get("workflow_step", "PRELIMS")
         
         # Set created_at from metadata (same format as main endpoint)
         if file.get("metadata", {}).get("created_at"):
@@ -510,6 +817,17 @@ async def upload_permit_file(
     # Read file content for hashing
     content = await pdf.read()
     
+    # Extract ZIP code from PDF (auto-detection)
+    zip_code = _extract_zip_from_pdf_first_page(content)
+    state_code = None
+    team_lead_from_zip = None
+    
+    if zip_code:
+        state_code = _validate_zip_and_get_state(zip_code)
+        if state_code:
+            team_lead_from_zip = _choose_team_lead_for_state(state_code)
+            logger.info(f"[UPLOAD] Auto-detected: ZIP {zip_code} -> State {state_code} -> Team Lead {team_lead_from_zip}")
+    
     # Generate content hash for deduplication
     from app.services.file_deduplication_service import FileDeduplicationService
     file_hash = FileDeduplicationService.generate_content_hash(content)
@@ -524,7 +842,6 @@ async def upload_permit_file(
         existing_file = db.permit_files.find_one({"file_id": existing_file_id})
         if existing_file:
             # Get stage tracking information
-            from app.services.stage_tracking_service import get_stage_tracking_service
             stage_service = get_stage_tracking_service()
             tracking = stage_service.get_file_tracking(existing_file_id)
             
@@ -533,8 +850,14 @@ async def upload_permit_file(
             current_status = "UNKNOWN"
             
             if tracking:
-                current_stage = tracking.current_stage.value if hasattr(tracking.current_stage, 'value') else str(tracking.current_stage)
-                current_status = tracking.current_status
+                if isinstance(tracking, dict):
+                    raw_stage = tracking.get('current_stage')
+                    current_stage = str(raw_stage) if raw_stage is not None else "UNKNOWN"
+                    raw_status = tracking.get('current_status')
+                    current_status = str(raw_status) if raw_status is not None else "UNKNOWN"
+                else:
+                    current_stage = tracking.current_stage.value if hasattr(tracking.current_stage, 'value') else str(tracking.current_stage)
+                    current_status = tracking.current_status
             
             # Check if trying to re-upload in the same stage
             if workflow_step.upper() == current_stage.upper():
@@ -581,18 +904,24 @@ async def upload_permit_file(
             
             # Prepare detailed stage history with time tracking
             stage_history = []
-            if tracking and hasattr(tracking, 'stage_history') and tracking.stage_history:
-                for history_entry in tracking.stage_history:
-                    if isinstance(history_entry, dict):
-                        stage_history.append({
-                            "stage": history_entry.get("stage"),
-                            "status": history_entry.get("stage_status"),
-                            "employee": history_entry.get("employee_code"),
-                            "employee_name": history_entry.get("employee_name"),
-                            "started_at": history_entry.get("started_stage_at"),
-                            "completed_at": history_entry.get("completed_stage_at"),
-                            "duration_minutes": _calculate_stage_duration(history_entry)
-                        })
+            if tracking:
+                stage_history_data = None
+                if isinstance(tracking, dict):
+                    stage_history_data = tracking.get('stage_history')
+                else:
+                    stage_history_data = getattr(tracking, 'stage_history', None)
+                if stage_history_data:
+                    for history_entry in stage_history_data:
+                        if isinstance(history_entry, dict):
+                            stage_history.append({
+                                "stage": history_entry.get("stage"),
+                                "status": history_entry.get("stage_status"),
+                                "employee": history_entry.get("employee_code"),
+                                "employee_name": history_entry.get("employee_name"),
+                                "started_at": history_entry.get("started_stage_at"),
+                                "completed_at": history_entry.get("completed_stage_at"),
+                                "duration_minutes": _calculate_stage_duration(history_entry)
+                            })
             
             logger.info(f"Stage progression: {pdf.filename} from {current_stage} to {workflow_step}")
             
@@ -649,8 +978,14 @@ async def upload_permit_file(
         },
         "project_details": {
             "client_name": client_name,
-            "project_name": project_name or "Unnamed Project"
+            "project_name": project_name or "Unnamed Project",
+            "zip_code": zip_code,  # Add auto-detected ZIP
+            "state": state_code,   # Add resolved state
+            "team_lead": team_lead_from_zip  # Add auto-detected team lead
         },
+        "detected_zip": zip_code,  # For compatibility with zip_assign.py
+        "detected_state": state_code,
+        "locked_team_lead": team_lead_from_zip,
         "assigned_to_lead": assigned_to_lead,
         "workflow_step": workflow_step,  # Store the workflow step
         "status": initial_status,  # Set status based on workflow step
@@ -724,7 +1059,10 @@ async def upload_permit_file(
     
     # Initialize stage tracking for the file
     try:
+        logger.info(f"🔍 Starting stage tracking initialization for {file_id}")
         stage_service = get_stage_tracking_service()
+        logger.info(f"✅ Got stage tracking service")
+        
         # Map workflow_step to FileStage
         stage_mapping = {
             "PRELIMS": FileStage.PRELIMS,
@@ -732,10 +1070,16 @@ async def upload_permit_file(
             "QC": FileStage.QC
         }
         initial_stage = stage_mapping.get(workflow_step, FileStage.PRELIMS)
-        stage_service.initialize_file_tracking(file_id, initial_stage)
+        logger.info(f"📍 Mapped workflow_step {workflow_step} to FileStage {initial_stage}")
+        
+        tracking = stage_service.initialize_file_tracking(file_id, initial_stage)
+        logger.info(f"✅ Successfully initialized stage tracking for {file_id} at stage {initial_stage}")
     except Exception as e:
         # Log error but don't fail the upload
-        print(f"Warning: Failed to initialize stage tracking for {file_id}: {str(e)}")
+        import traceback
+        logger.error(f"❌ Failed to initialize stage tracking for {file_id}: {str(e)}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
     
     return {
         "file_id": file_id,
@@ -764,12 +1108,38 @@ async def smart_upload_and_assign(
 
         stage_service = get_stage_tracking_service()
 
-        # Resume logic: same file uploaded again
-        existing = db.permit_files.find_one({"file_hash": file_hash}, {"_id": 0})
+        # Enhanced file detection: check by hash first, then by filename
+        from app.services.file_deduplication_service import FileDeduplicationService
+        existing_file_id = FileDeduplicationService.find_existing_file(
+            file_hash, len(pdf_bytes), pdf.filename
+        )
+        
+        existing = None
+        if existing_file_id:
+            existing = db.permit_files.find_one({"file_id": existing_file_id}, {"_id": 0})
+        
         if existing:
             file_id = existing.get("file_id")
             if not file_id:
                 raise HTTPException(status_code=500, detail="Existing file record missing file_id")
+            
+            # Check if content is different (same filename, updated content)
+            if existing.get("file_hash") != file_hash:
+                # Track as new version
+                upload_info = {
+                    'uploaded_at': datetime.utcnow(),
+                    'uploaded_by': assigned_by_final,
+                    'file_size': len(pdf_bytes),
+                    'change_reason': 'File updated via smart upload'
+                }
+                FileDeduplicationService.track_file_version(file_id, file_hash, upload_info)
+                
+                # Update the file hash
+                db.permit_files.update_one(
+                    {'file_id': file_id},
+                    {'$set': {'file_hash': file_hash}}
+                )
+                logger.info(f"Tracked new version for file {file_id} (same filename, different content)")
 
             locked_lead = existing.get("locked_team_lead") or existing.get("assigned_to_lead")
 
@@ -849,6 +1219,216 @@ async def smart_upload_and_assign(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in smart upload and assign: {str(e)}")
+
+
+@router.post("/sequential-workflow")
+async def sequential_workflow_upload(
+    pdf: UploadFile = File(...),
+    task_description: str = Form(...),
+    assigned_by: Optional[str] = Form(None),
+):
+    """
+    Sequential workflow upload - handles the exact workflow:
+    1. First upload: PRELIMS stage
+    2. Same file upload: PRODUCTION stage  
+    3. Same file upload: Move from COMPLETED to QC stage
+    4. QC completion: Move to DELIVERED
+    """
+    try:
+        db = get_db()
+
+        pdf_bytes = await pdf.read()
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="Empty PDF")
+
+        file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        assigned_by_final = (assigned_by or "").strip() or "SYSTEM"
+
+        # Enhanced file detection: check by hash first, then by filename
+        from app.services.file_deduplication_service import FileDeduplicationService
+        existing_file_id = FileDeduplicationService.find_existing_file(
+            file_hash, len(pdf_bytes), pdf.filename
+        )
+        
+        existing = None
+        if existing_file_id:
+            existing = db.permit_files.find_one({"file_id": existing_file_id}, {"_id": 0})
+        
+        if not existing:
+            # FIRST UPLOAD - Create new file and start PRELIMS
+            file_id = generate_file_id()
+            
+            # Save file
+            filename = f"{file_id}.pdf"
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            with open(file_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            # Create permit file record
+            permit_file = {
+                "file_id": file_id,
+                "file_hash": file_hash,
+                "file_info": {
+                    "original_filename": pdf.filename,
+                    "file_path": file_path,
+                    "file_size": len(pdf_bytes),
+                    "mime_type": pdf.content_type,
+                    "uploaded_at": datetime.utcnow()
+                },
+                "status": "IN_PRELIMS",
+                "workflow_step": "PRELIMS",
+                "locked_team_lead": assigned_by_final,
+                "tasks_created": [],
+                "metadata": {
+                    "uploaded_by": assigned_by_final,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }
+            }
+            
+            db.permit_files.insert_one(permit_file)
+            
+            # Initialize stage tracking
+            stage_service = get_stage_tracking_service()
+            stage_service.initialize_file_tracking(file_id, FileStage.PRELIMS)
+            
+            # Create PRELIMS task
+            task_data = TaskCreate(
+                title=f"PRELIMS: {pdf.filename}",
+                description=task_description,
+                permit_file_id=file_id,
+                stage="PRELIMS",
+                priority="MEDIUM"
+            )
+            
+            task = await create_task(task_data, assigned_by_final)
+            
+            return {
+                "success": True,
+                "action": "PRELIMS_STARTED",
+                "file_id": file_id,
+                "message": f"File uploaded and PRELIMS task created",
+                "stage": "PRELIMS",
+                "task_id": task.get("task_id") if task else None
+            }
+        
+        else:
+            # EXISTING FILE - Handle sequential progression
+            file_id = existing.get("file_id")
+            stage_service = get_stage_tracking_service()
+            tracking = stage_service.get_file_tracking(file_id)
+            
+            if not tracking:
+                raise HTTPException(status_code=500, detail="File tracking not found")
+            
+            current_stage = tracking.current_stage.value
+            
+            if current_stage == "PRELIMS":
+                # Move to PRODUCTION
+                if tracking.current_status != "COMPLETED":
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="PRELIMS stage must be completed before moving to PRODUCTION"
+                    )
+                
+                # Transition to PRODUCTION
+                stage_service.transition_to_next_stage(file_id, assigned_by_final, FileStage.PRODUCTION)
+                
+                # Create PRODUCTION task
+                task_data = TaskCreate(
+                    title=f"PRODUCTION: {existing.get('file_info', {}).get('original_filename', pdf.filename)}",
+                    description=task_description,
+                    permit_file_id=file_id,
+                    stage="PRODUCTION",
+                    priority="HIGH"
+                )
+                
+                task = await create_task(task_data, assigned_by_final)
+                
+                return {
+                    "success": True,
+                    "action": "PRODUCTION_STARTED",
+                    "file_id": file_id,
+                    "message": f"File moved to PRODUCTION and task created",
+                    "stage": "PRODUCTION",
+                    "task_id": task.get("task_id") if task else None
+                }
+                
+            elif current_stage == "PRODUCTION":
+                # Move to COMPLETED (automatic when PRODUCTION tasks complete)
+                if tracking.current_status != "COMPLETED":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="PRODUCTION stage must be completed before moving to COMPLETED"
+                    )
+                
+                return {
+                    "success": True,
+                    "action": "ALREADY_COMPLETED",
+                    "file_id": file_id,
+                    "message": f"File is already in COMPLETED stage. Ready for QC.",
+                    "stage": "COMPLETED"
+                }
+                
+            elif current_stage == "COMPLETED":
+                # Move to QC stage
+                stage_service.transition_to_next_stage(file_id, assigned_by_final, FileStage.QC)
+                
+                # Create QC task
+                task_data = TaskCreate(
+                    title=f"QC: {existing.get('file_info', {}).get('original_filename', pdf.filename)}",
+                    description=task_description,
+                    permit_file_id=file_id,
+                    stage="QC",
+                    priority="HIGH"
+                )
+                
+                task = await create_task(task_data, assigned_by_final)
+                
+                return {
+                    "success": True,
+                    "action": "QC_STARTED",
+                    "file_id": file_id,
+                    "message": f"File moved to QC stage and task created",
+                    "stage": "QC",
+                    "task_id": task.get("task_id") if task else None
+                }
+                
+            elif current_stage == "QC":
+                # Move to DELIVERED (automatic when QC tasks complete)
+                if tracking.current_status != "COMPLETED":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="QC stage must be completed before moving to DELIVERED"
+                    )
+                
+                return {
+                    "success": True,
+                    "action": "ALREADY_DELIVERED",
+                    "file_id": file_id,
+                    "message": f"File is already in DELIVERED stage",
+                    "stage": "DELIVERED"
+                }
+                
+            elif current_stage == "DELIVERED":
+                return {
+                    "success": True,
+                    "action": "WORKFLOW_COMPLETE",
+                    "file_id": file_id,
+                    "message": f"File workflow is complete (DELIVERED)",
+                    "stage": "DELIVERED"
+                }
+                
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown stage: {current_stage}"
+                )
+        
+    except Exception as e:
+        logger.error(f"Error in sequential workflow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error in sequential workflow: {str(e)}")
+
 
 @router.post("/cleanup-duplicates")
 async def cleanup_duplicate_files():

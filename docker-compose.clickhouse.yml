@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # ClickHouse Server
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: task_analytics_ch
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native interface
+    environment:
+      CLICKHOUSE_DB: task_analytics
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse-config:/etc/clickhouse-server/config.d
+    networks:
+      - analytics_network
+
+  # ClickHouse Client (for initial setup)
+  clickhouse-client:
+    image: clickhouse/clickhouse-client:23.8
+    container_name: ch_client
+    depends_on:
+      - clickhouse
+    command: >
+      sh -c "
+      echo 'CREATE DATABASE IF NOT EXISTS task_analytics;' |
+      clickhouse client --host clickhouse --query
+      echo 'SHOW DATABASES;' |
+      clickhouse client --host clickhouse --query
+      "
+    networks:
+      - analytics_network
+    profiles:
+      - analytics
+
+  # Redis for caching (optional but recommended)
+  redis:
+    image: redis:7-alpine
+    container_name: task_cache
+    volumes:
+      - redis_data:/data
+    networks:
+      - analytics_network
+
+volumes:
+  clickhouse_data:
+  clickhouse-config:
+  redis_data:
+
+networks:
+  analytics_network:
+    driver: bridge

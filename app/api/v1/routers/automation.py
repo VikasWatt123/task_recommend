@@ -1,5 +1,5 @@
 """
-Automation endpoints for n8n workflows - Integrated with existing task flow
+Automation endpoints for external system integration - Integrated with existing task flow
 """
 from fastapi import APIRouter, HTTPException, Depends, Body
 from typing import List, Dict, Any, Optional
@@ -16,14 +16,14 @@ logger = logging.getLogger(__name__)
 
 # Initialize services
 recommendation_engine = get_recommendation_engine()
-stage_service = get_stage_tracking_service()
+# stage_service = get_stage_tracking_service()  # Initialize at module load
 
 class AutoAssignRequest(BaseModel):
     file_id: str
     file_name: str = "Unknown file"
     workflow_step: str = "PRELIMS"
     priority_rules: Optional[Dict[str, Any]] = None
-    assigned_by: Optional[str] = "n8n-automation"
+    assigned_by: Optional[str] = "external_automation"
 
 @router.post("/auto-assign")
 async def auto_assign_task(
@@ -41,7 +41,7 @@ async def auto_assign_task(
         file_name = request.file_name
         workflow_step = request.workflow_step
         priority_rules = request.priority_rules
-        assigned_by = request.assigned_by or "n8n-automation"
+        assigned_by = request.assigned_by or "external_automation"
         
         # Create task description
         task_description = f"Review permit file {file_id} - {file_name} ({workflow_step} workflow)"

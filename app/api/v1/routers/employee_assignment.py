@@ -105,6 +105,17 @@ async def intelligent_assignment(
                 target_stage = StageAssignmentService.detect_stage_from_description(task_description)
                 
             if not target_stage:
+                if file_id:
+                    # Check if file is in COMPLETED stage
+                    from app.db.mongodb import get_db
+                    db = get_db()
+                    file_tracking = db.file_tracking.find_one({'file_id': file_id})
+                    if file_tracking and file_tracking.get('current_stage') == 'COMPLETED':
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"File {file_id} is in COMPLETED stage. Manager must move file to QC stage before assigning tasks. Use /api/v1/stage-tracking/move-to-qc/{file_id}"
+                        )
+                
                 raise HTTPException(
                     status_code=400, 
                     detail="Could not determine stage from task description. Please specify stage explicitly."

@@ -13,26 +13,35 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# Toggle to disable ClickHouse (set to True to enable, False to disable)
+CLICKHOUSE_ENABLED = True
+
 _MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 class ClickHouseService:
     """Service for ClickHouse analytics operations"""
     
     def __init__(self):
-        # Initialize ClickHouse client
-        self.client = Client(
-            host='localhost',
-            port=9000,
-            database='task_analytics',
-            # Add authentication if needed
-            # user='default',
-            # password='',
+        # Initialize ClickHouse client only if enabled
+        self.client = None
+        if CLICKHOUSE_ENABLED:
+            self.client = Client(
+                host='localhost',
+                port=9000,
+                database='task_analytics',
+                # Add authentication if needed
+                # user='default',
+                # password='',
             # secure=False
         )
         self._ensure_tables()
     
     def _ensure_tables(self):
         """Create analytics tables if they don't exist"""
+        if not CLICKHOUSE_ENABLED:
+            logger.info("ClickHouse is disabled - skipping table creation")
+            return
+        
         try:
             # Task events table (updated for event-driven analytics)
             self.client.execute("""
@@ -48,6 +57,7 @@ class ClickHouseService:
                     completed_at Nullable(DateTime64(3)),
                     duration_minutes UInt32,
                     file_id String,
+                    tracking_mode String DEFAULT 'FILE_BASED',
                     date Date MATERIALIZED (toDate(assigned_at)),
                     team_lead_id String,
                     skills_required Array(String),
@@ -103,6 +113,76 @@ class ClickHouseService:
                 ORDER BY (timestamp, metric_name)
             """)
             
+            # File lifecycle events table
+            self.client.execute("""
+                CREATE TABLE IF NOT EXISTS file_lifecycle_events (
+                    event_id String,
+                    file_id String,
+                    event_type String,
+                    stage String,
+                    employee_code String,
+                    employee_name String,
+                    event_time DateTime64(3),
+                    event_data String,
+                    previous_stage Nullable(String),
+                    next_stage Nullable(String),
+                    duration_minutes UInt32,
+                    created_at DateTime64(3) DEFAULT now64()
+                ) ENGINE = MergeTree()
+                ORDER BY (file_id, event_time, event_type)
+            """)
+            
+            # File current state table
+            self.client.execute("""
+                CREATE TABLE IF NOT EXISTS file_current_state (
+                    file_id String,
+                    current_stage String,
+                    current_status String,
+                    current_employee_code String,
+                    current_employee_name String,
+                    last_updated DateTime64(3),
+                    total_duration_minutes UInt32
+                ) ENGINE = ReplacingMergeTree(last_updated)
+                ORDER BY file_id
+            """)
+            
+            # File events table
+            self.client.execute("""
+                CREATE TABLE IF NOT EXISTS file_events (
+                    file_id String,
+                    event_type String,
+                    event_time DateTime64(3) DEFAULT now64()
+                ) ENGINE = MergeTree()
+                ORDER BY (file_id, event_time)
+            """)
+            
+            # File lifecycle table (for real-time pipeline tracking)
+            self.client.execute("""
+                CREATE TABLE IF NOT EXISTS file_lifecycle (
+                    file_id String,
+                    current_stage String,
+                    current_status String,
+                    uploaded_at DateTime64(3),
+                    sla_deadline Nullable(DateTime64(3)),
+                    last_updated DateTime64(3) DEFAULT now64()
+                ) ENGINE = ReplacingMergeTree(last_updated)
+                ORDER BY file_id
+            """)
+            
+            # Task file map table (for employee-file associations)
+            self.client.execute("""
+                CREATE TABLE IF NOT EXISTS task_file_map (
+                    file_id String,
+                    task_id String,
+                    employee_id String,
+                    employee_name String,
+                    task_status String,
+                    assigned_at DateTime64(3),
+                    completed_at Nullable(DateTime64(3))
+                ) ENGINE = MergeTree()
+                ORDER BY (file_id, assigned_at)
+            """)
+            
             logger.info("ClickHouse tables ensured")
             
         except Exception as e:
@@ -114,6 +194,10 @@ class ClickHouseService:
     
     async def sync_tasks_from_mongodb(self, since: Optional[datetime] = None):
         """Sync task data from MongoDB to ClickHouse"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            logger.info("ClickHouse is disabled - skipping MongoDB sync")
+            return
+        
         try:
             db = get_db()
 
@@ -155,7 +239,17 @@ class ClickHouseService:
                     else:
                         start_time = start_time
                     
-                    duration = int((completed_at - start_time).total_seconds() / 60)
+                    # Calculate duration and ensure it's non-negative (UInt32 requirement)
+                    duration_seconds = (completed_at - start_time).total_seconds()
+                    duration = max(0, int(duration_seconds / 60))  # Clamp to 0 if negative
+                    
+                    # Log warning if negative duration detected (data quality issue)
+                    if duration_seconds < 0:
+                        logger.warning(
+                            f"Negative duration detected for task {task.get('task_id')}: "
+                            f"completed_at={completed_at}, start_time={start_time}. "
+                            f"Setting duration to 0."
+                        )
                 
                 employee_code = task.get('assigned_to')
                 emp_doc = employee_lookup.get(employee_code) if employee_code else None
@@ -190,8 +284,11 @@ class ClickHouseService:
                     # Fallback for manual tasks: use task_id as file_id so they appear in analytics
                     file_id = task.get('task_id') or str(task.get('_id'))
                 
-                # Skip tasks without valid file_id for analytics
-                if not file_id or file_id.strip() == '' or file_id == 'None':
+                # Extract tracking_mode from task
+                tracking_mode = task.get('tracking_mode', 'FILE_BASED' if file_id and file_id.strip() and file_id != 'None' else 'STANDALONE')
+                
+                # Skip tasks without valid file_id for analytics (only if FILE_BASED)
+                if tracking_mode == 'FILE_BASED' and (not file_id or file_id.strip() == '' or file_id == 'None'):
                     skipped_missing_file_id += 1
                     if len(skipped_missing_file_id_samples) < 5:
                         skipped_missing_file_id_samples.append(task.get('task_id') or str(task.get('_id') or 'unknown'))
@@ -206,7 +303,8 @@ class ClickHouseService:
                     assigned_at_value,
                     completed_at_value,
                     int(duration),
-                    file_id,
+                    file_id or '',  # Empty string for standalone tasks
+                    tracking_mode,  # Add tracking_mode
                     manager_code,
                     task.get('skills_required', []),
                     1 if task.get('priority') == 'HIGH' else 0,
@@ -217,7 +315,7 @@ class ClickHouseService:
             # Batch insert into ClickHouse
             # Avoid inserting into any materialized `date` column; ClickHouse will compute it.
             self.client.execute(
-                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
+                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, tracking_mode, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
                 batch_rows
             )
             
@@ -234,6 +332,10 @@ class ClickHouseService:
     
     async def sync_employee_performance(self, days: int = 30):
         """Calculate and sync employee performance metrics"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            logger.info("ClickHouse is disabled - skipping employee performance sync")
+            return
+        
         try:
             # Get performance data from ClickHouse
             end_date = datetime.now().date()
@@ -293,6 +395,9 @@ class ClickHouseService:
     
     def get_task_analytics(self, days: int = 30, stage: Optional[str] = None):
         """Get task analytics with 100x speed"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return []
+        
         try:
             where_clause = ""
             if stage:
@@ -322,6 +427,9 @@ class ClickHouseService:
     
     def get_pipeline_view(self, stage: Optional[str] = None):
         """Get pipeline view with 100x speed using ClickHouse - optimized"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return []
+        
         try:
             stage_filter = ""
             if stage:
@@ -379,6 +487,9 @@ class ClickHouseService:
 
     def get_reporting_manager_overview(self, days: int = 7, limit_employees: int = 5):
         """Get reporting manager analytics overview from ClickHouse"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return {"managers": [], "employees": [], "days": days, "limit_employees": limit_employees}
+        
         try:
             managers = self.client.execute(f"""
                 SELECT
@@ -427,6 +538,9 @@ class ClickHouseService:
     
     def get_employee_performance(self, days: int = 30, limit: int = 100):
         """Get top employee performance metrics"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return []
+        
         try:
             return self.client.execute(f"""
                 SELECT 
@@ -451,6 +565,9 @@ class ClickHouseService:
     
     def get_sla_analytics(self, days: int = 30):
         """Get SLA compliance analytics"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return []
+        
         try:
             return self.client.execute(f"""
                 SELECT 
@@ -473,6 +590,9 @@ class ClickHouseService:
     
     def get_real_time_metrics(self, hours: int = 24):
         """Get real-time metrics for dashboard"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return []
+        
         try:
             return self.client.execute(f"""
                 SELECT 
@@ -491,6 +611,9 @@ class ClickHouseService:
     
     async def update_real_time_metric(self, metric_name: str, value: float, tags: Dict[str, str] = None):
         """Update real-time metric"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return
+        
         try:
             self.client.execute(
                 'INSERT INTO realtime_metrics VALUES',
@@ -507,6 +630,9 @@ class ClickHouseService:
     # Event-driven analytics functions
     async def emit_file_created_event(self, file_id: str, file_name: str, uploaded_by: str):
         """Emit file creation event to ClickHouse"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return
+        
         try:
             event_data = {
                 'task_id': f"FILE-{file_id}",
@@ -534,13 +660,20 @@ class ClickHouseService:
         except Exception as e:
             logger.error(f"Failed to emit file_created event: {e}")
     
-    async def emit_task_assigned_event(self, task_id: str, employee_code: str, employee_name: str, assigned_by: str, file_id_param: str = None):
+    async def emit_task_assigned_event(self, task_id: str, employee_code: str, employee_name: str, assigned_by: str, file_id_param: str = None, tracking_mode: str = None):
         """Emit task assignment event to ClickHouse"""
+        if not CLICKHOUSE_ENABLED:
+            logger.info(f"ClickHouse disabled - skipping task assignment event for {task_id}")
+            return
+        
         try:
             from app.db.mongodb import get_db
             db = get_db()
             task = db.tasks.find_one({"task_id": task_id})
             true_stage = task.get("stage", "UNASSIGNED") if task else "UNASSIGNED"
+            
+            # Determine tracking_mode
+            effective_tracking_mode = tracking_mode or (task.get('tracking_mode') if task else None) or ('FILE_BASED' if file_id_param else 'STANDALONE')
             
             event_data = {
                 'task_id': task_id,
@@ -552,6 +685,7 @@ class ClickHouseService:
                 'completed_at': None,
                 'duration_minutes': 0,
                 'file_id': file_id_param or '',
+                'tracking_mode': effective_tracking_mode,
                 'team_lead_id': assigned_by,
                 'skills_required': [],
                 'priority': 0,
@@ -560,22 +694,28 @@ class ClickHouseService:
             }
             
             self.client.execute(
-                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
+                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, tracking_mode, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
                 [event_data]
             )
             
-            logger.info(f"Emitted task_assigned event for {task_id} to {employee_code}")
+            logger.info(f"Emitted task_assigned event for {task_id} to {employee_code} (tracking_mode={effective_tracking_mode})")
             
         except Exception as e:
             logger.error(f"Failed to emit task_assigned event: {e}")
     
-    async def emit_stage_started_event(self, task_id: str, employee_code: str, employee_name: str, stage: str, file_id_param: str = None):
+    async def emit_stage_started_event(self, task_id: str, employee_code: str, employee_name: str, stage: str, file_id_param: str = None, tracking_mode: str = None):
         """Emit stage started event to ClickHouse"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return
+        
         try:
             from app.db.mongodb import get_db
             db = get_db()
             task = db.tasks.find_one({"task_id": task_id})
             task_name = task.get('title', '') if task else ''
+            
+            # Determine tracking_mode
+            effective_tracking_mode = tracking_mode or (task.get('tracking_mode') if task else None) or ('FILE_BASED' if file_id_param else 'STANDALONE')
             
             event_data = {
                 'task_id': task_id,
@@ -587,6 +727,7 @@ class ClickHouseService:
                 'completed_at': None,
                 'duration_minutes': 0,
                 'file_id': file_id_param or '',
+                'tracking_mode': effective_tracking_mode,
                 'team_lead_id': '',
                 'skills_required': [],
                 'priority': 0,
@@ -595,22 +736,28 @@ class ClickHouseService:
             }
             
             self.client.execute(
-                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
+                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, tracking_mode, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
                 [event_data]
             )
             
-            logger.info(f"Emitted stage_started event for {task_id} in {stage}")
+            logger.info(f"Emitted stage_started event for {task_id} in {stage} (tracking_mode={effective_tracking_mode})")
             
         except Exception as e:
             logger.error(f"Failed to emit stage_started event: {e}")
     
-    async def emit_stage_completed_event(self, task_id: str, employee_code: str, employee_name: str, stage: str, duration_minutes: int, file_id_param: str = None):
+    async def emit_stage_completed_event(self, task_id: str, employee_code: str, employee_name: str, stage: str, duration_minutes: int, file_id_param: str = None, tracking_mode: str = None):
         """Emit stage completed event to ClickHouse"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return
+        
         try:
             from app.db.mongodb import get_db
             db = get_db()
             task = db.tasks.find_one({"task_id": task_id})
             task_name = task.get('title', '') if task else ''
+            
+            # Determine tracking_mode
+            effective_tracking_mode = tracking_mode or (task.get('tracking_mode') if task else None) or ('FILE_BASED' if file_id_param else 'STANDALONE')
             
             event_data = {
                 'task_id': task_id,
@@ -622,6 +769,7 @@ class ClickHouseService:
                 'completed_at': datetime.utcnow(),
                 'duration_minutes': duration_minutes,
                 'file_id': file_id_param or '',
+                'tracking_mode': effective_tracking_mode,
                 'team_lead_id': '',
                 'skills_required': [],
                 'priority': 0,
@@ -630,17 +778,20 @@ class ClickHouseService:
             }
             
             self.client.execute(
-                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
+                'INSERT INTO task_events (task_id, employee_code, employee_name, stage, status, assigned_at, completed_at, duration_minutes, file_id, tracking_mode, team_lead_id, skills_required, priority, event_type, task_name) VALUES',
                 [event_data]
             )
             
-            logger.info(f"Emitted stage_completed event for {task_id} in {stage}")
+            logger.info(f"Emitted stage_completed event for {task_id} in {stage} (tracking_mode={effective_tracking_mode})")
             
         except Exception as e:
             logger.error(f"Failed to emit stage_completed event: {e}")
     
     async def emit_sla_breach_event(self, file_id: str, employee_code: str, employee_name: str, stage: str, sla_status: str, file_id_param: str = None):
         """Emit SLA breach event to ClickHouse"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return
+        
         try:
             event_data = {
                 'task_id': f"SLA-{file_id}",
@@ -672,6 +823,9 @@ class ClickHouseService:
         """Synchronous SLA breach event recorder - NO async calls"""
         # This method now only records the event, does NOT emit
         # Emission is handled by async SLAEventEmitter
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return
+        
         try:
             # Insert SLA breach event into file_events (idempotent)
             self.client.execute(
@@ -684,6 +838,9 @@ class ClickHouseService:
     
     def update_file_stage(self, file_id: str, new_stage: str):
         """Update current_stage in file_lifecycle for deterministic stage tracking"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return
+        
         try:
             # ClickHouse requires OPTIMIZE TABLE after ALTER TABLE UPDATE
             self.client.execute(
@@ -697,6 +854,9 @@ class ClickHouseService:
     
     def get_pipeline_view_realtime(self, stage_filter: str = None):
         """Get pipeline view using file_lifecycle for real-time stage tracking"""
+        if not CLICKHOUSE_ENABLED or self.client is None:
+            return []
+        
         try:
             where_clause = f"AND fl.current_stage = '{stage_filter}'" if stage_filter else ""
             

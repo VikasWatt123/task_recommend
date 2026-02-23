@@ -9,6 +9,7 @@ import { useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api } from "@/lib/api";
+import { getAssignmentInfo } from "@/utils/taskHelpers";
 
 interface PermitFileRowProps {
   file: PermitFile;
@@ -43,30 +44,8 @@ export function PermitFileRow({ file, index = 0 }: PermitFileRowProps) {
     }
   };
   
-  // Get assignment info
-  const getAssignmentInfo = () => {
-    // Check for current_assignment from stage tracking first
-    if (file.current_assignment) {
-      return {
-        assignedTo: file.current_assignment.employee_code,
-        assignedToName: file.current_assignment.employee_name,
-        assignedAt: file.current_assignment.started_at ? new Date(file.current_assignment.started_at) : new Date(),
-        stage: file.current_step || file.status
-      };
-    }
-    // Fallback to old assignment format
-    if (file.assignment) {
-      return {
-        assignedTo: file.assignment.assigned_to,
-        assignedToName: undefined, // This field doesn't exist in the old format
-        assignedAt: new Date(file.assignment.assigned_at),
-        stage: file.assignment.assigned_for_stage
-      };
-    }
-    return null;
-  };
-  
-  const assignmentInfo = getAssignmentInfo();
+  // Use helper function for assignment info
+  const assignmentInfo = getAssignmentInfo(file);
   
   // Load detailed report
   const loadReport = async () => {

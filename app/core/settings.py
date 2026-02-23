@@ -40,6 +40,19 @@ class Settings(BaseSettings):
     gemini_embedding_dimension: int | None = None
     project_id: str | None = None
     location: str | None = None
+    
+    # MySQL Configuration
+    mysql_host: str | None = None
+    mysql_port: int = 3306
+    mysql_database: str | None = None
+    mysql_user: str | None = None
+    mysql_password: str | None = None
+    
+    # MySQL SSH Configuration
+    mysql_ssh_host: str | None = None
+    mysql_ssh_port: int = 22
+    mysql_ssh_user: str | None = None
+    mysql_ssh_key_path: str = "prod-key.pem"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
 

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Sparkles, Users, ArrowRight, Loader2, CheckCircle, Search, Eye, Upload, FileText, X, Briefcase, Plus, FolderOpen, ChevronDown, Play } from "lucide-react";
+import { Sparkles, Users, ArrowRight, Loader2, CheckCircle, Search, Eye, FileText, X, Briefcase, Plus, FolderOpen, ChevronDown, Play, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
@@ -8,7 +8,19 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
-import { getEmployeesGroupedByTeamLead, getEmployeeRecommendations, getEmployeeTaskStats, getEmployeeTasks, assignTaskToEmployee, getUnassignedFiles, smartUploadAndAssign, getFileStageHistory } from "@/lib/api";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { 
+  getEmployeesGroupedByTeamLead,
+  getEmployeeRecommendations, 
+  getGeminiRecommendations,
+  assignTaskToEmployee,
+  getUnassignedFiles,
+  getEmployeeTasks,
+  getFileStageHistory,
+  getEmployeeTaskStats,
+  setEmployeeCode,
+  initializeStageTracking
+} from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 import { Employee, PermitFile, Recommendation, StageHistoryEntry, TeamLeadGroup, Task } from "@/types";
 import { EmployeeDetailModal } from "@/components/employees/EmployeeDetailModal";
@@ -18,18 +30,21 @@ export default function SmartRecommender() {
   const [teams, setTeams] = useState<TeamLeadGroup[]>([]);
   const [selectedTeam, setSelectedTeam] = useState<TeamLeadGroup | null>(null);
   const [taskDescription, setTaskDescription] = useState("");
+  const [address, setAddress] = useState("");
+  const [hasFileId, setHasFileId] = useState(false);
+  const [manualFileId, setManualFileId] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [isLoadingRecommendations, setIsLoadingRecommendations] = useState(false);
   const [expandedTaskCards, setExpandedTaskCards] = useState<Set<string>>(new Set());
   const [activeTab, setActiveTab] = useState("team-members");
+  const [assignmentMode, setAssignmentMode] = useState<'auto-assign' | 'recommendation-only'>('auto-assign');
   type TeamsCacheValue = TeamLeadGroup[] | number;
   const [teamsDataCache, setTeamsDataCache] = useState<Map<string, TeamsCacheValue>>(new Map());
   const [isLoadingTeams, setIsLoadingTeams] = useState(false);
   const [uploadedFile, setUploadedFile] = useState<{id: string, name: string} | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [showUnassignedFiles, setShowUnassignedFiles] = useState(false);
-  const [selectedPdfFile, setSelectedPdfFile] = useState<File | null>(null);
   type AutoAssignedTeamLead = { name?: string };
   type AutoAssignedEmployee = { employee_name?: string; employee_code?: string };
   type EmployeeTaskStatsResponse = {
@@ -57,6 +72,7 @@ export default function SmartRecommender() {
   const [autoAssignedTaskId, setAutoAssignedTaskId] = useState<string | null>(null);
   const [hasComputed, setHasComputed] = useState(false);
   const [lastTaskContext, setLastTaskContext] = useState<string>('');
+  const [resolvedTeamLead, setResolvedTeamLead] = useState<{code?: string, name?: string, source?: string} | null>(null);
   const [selectedEmployee, setSelectedEmployee] = useState<Employee | null>(null);
   const [employeeTasks, setEmployeeTasks] = useState<Task[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -108,7 +124,6 @@ export default function SmartRecommender() {
     current_tasks?: Task[];
     tasks_loaded?: boolean;
   };
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
   const detectRequestedStage = (taskDesc: string): 'PRELIMS' | 'PRODUCTION' | 'QC' | null => {
@@ -150,10 +165,19 @@ export default function SmartRecommender() {
       QC: scoreFor(stageKeywords.QC),
     };
 
+    // Debug logging
+    console.log('🎯 Stage Detection for:', taskDesc);
+    console.log('📊 Scores:', scores);
+    console.log('🔍 PRELIMS matches:', descriptionLower.match(/\barora\b/g));
+    console.log('🔍 QC matches:', descriptionLower.match(/\bquality\b/g));
+
     const best = (Object.keys(scores) as Array<keyof typeof scores>)
       .sort((a, b) => scores[b] - scores[a])[0];
 
-    return scores[best] > 0 ? (best as 'PRELIMS' | 'PRODUCTION' | 'QC') : null;
+    const result = scores[best] > 0 ? (best as 'PRELIMS' | 'PRODUCTION' | 'QC') : null;
+    console.log('✅ Detected stage:', result);
+    
+    return result;
   };
 
   const normalizeStageForOrder = (rawStage: string | null | undefined): 'PRELIMS' | 'PRODUCTION' | 'QC' | null => {
@@ -193,18 +217,37 @@ export default function SmartRecommender() {
         violationMessage = 'This file does not show PRELIMS as completed. PRODUCTION work should typically start only after PRELIMS is completed.';
       }
 
-      if (requestedStage === 'QC' && !(hasCompleted('PRODUCTION') || hasCompleted('COMPLETED'))) {
-        violationMessage = 'This file does not show PRODUCTION as completed. QC work should typically start only after PRODUCTION is completed.';
+      if (requestedStage === 'QC' && !hasCompleted('COMPLETED')) {
+        violationMessage = 'File must complete PRODUCTION stage and be in COMPLETED stage before QC tasks can be assigned. Current stage: ' + (history?.current_stage || 'Unknown');
       }
 
       const stageOrder: Record<'PRELIMS' | 'PRODUCTION' | 'QC', number> = { PRELIMS: 0, PRODUCTION: 1, QC: 2 };
+      
+      // Check if file is already in a later stage
       if (currentStageNormalized && stageOrder[requestedStage] < stageOrder[currentStageNormalized]) {
-        violationMessage = `This file appears to already be at ${currentStageNormalized}. You are assigning a ${requestedStage} task (earlier stage).`;
+        const currentStageDisplay = history?.current_stage || currentStageNormalized;
+        
+        // Specific messages for different scenarios
+        if (currentStageNormalized === 'QC' && requestedStage === 'PRELIMS') {
+          violationMessage = `⚠️ This file is already in QC stage and has completed PRELIMS and PRODUCTION. Assigning a PRELIMS task to a file in QC stage may not be appropriate.\n\nCurrent file stage: ${currentStageDisplay}\nRequested task stage: ${requestedStage}`;
+        } else if (currentStageNormalized === 'QC' && requestedStage === 'PRODUCTION') {
+          violationMessage = `⚠️ This file is already in QC stage and has completed PRODUCTION. Assigning a PRODUCTION task to a file in QC stage may not be appropriate.\n\nCurrent file stage: ${currentStageDisplay}\nRequested task stage: ${requestedStage}`;
+        } else if (currentStageNormalized === 'PRODUCTION' && requestedStage === 'PRELIMS') {
+          violationMessage = `⚠️ This file is already in PRODUCTION stage and has completed PRELIMS. Assigning a PRELIMS task to a file in PRODUCTION stage may not be appropriate.\n\nCurrent file stage: ${currentStageDisplay}\nRequested task stage: ${requestedStage}`;
+        } else {
+          violationMessage = `⚠️ This file appears to already be at ${currentStageNormalized} stage. You are assigning a ${requestedStage} task (earlier stage).\n\nCurrent file stage: ${currentStageDisplay}\nRequested task stage: ${requestedStage}`;
+        }
+      }
+      
+      // Additional warning for files in COMPLETED or DELIVERED stage
+      if (history?.current_stage === 'COMPLETED' || history?.current_stage === 'DELIVERED') {
+        violationMessage = `⚠️ This file has already completed all workflow stages (PRELIMS → PRODUCTION → QC). It's currently marked as ${history.current_stage}.\n\nAssigning a new task to this file will create a task in ${requestedStage} stage for a file that's already completed the entire workflow.\n\nConsider using a new file instead.`;
       }
 
       if (violationMessage) {
+        const isCompletedFile = history?.current_stage === 'COMPLETED' || history?.current_stage === 'DELIVERED';
         openStageGateDialog(
-          'Stage order warning',
+          isCompletedFile ? '⚠️ File Already Completed' : 'Stage order warning',
           `${violationMessage}\n\nDo you want to continue anyway?`,
           action
         );
@@ -265,6 +308,7 @@ export default function SmartRecommender() {
       
       const filteredTeams = response.map(team => ({
         ...team,
+        team_size: team.employees ? team.employees.length : 0, // Calculate team_size from employees array
         employees: team.employees.map(employee => ({
           ...employee,
           active_task_count: 0,
@@ -303,6 +347,9 @@ export default function SmartRecommender() {
   };
 
   const handleSelectTeam = (team: TeamLeadGroup) => {
+    console.log('📋 Selected team:', team);
+    console.log('👥 Team employees count:', team.employees?.length || 0);
+    console.log('👥 Team employees:', team.employees);
     setSelectedTeam(team);
     setStep('view-tasks');
     // Don't reload teams data - it's already loaded and cached
@@ -313,6 +360,16 @@ export default function SmartRecommender() {
     setTaskDescription(value);
     // Clear recommendations if task description changes
     if (hasComputed && value !== lastTaskContext.split('|')[0]) {
+      setRecommendations([]);
+      setHasComputed(false);
+      setLastTaskContext('');
+    }
+  };
+
+  const handleAddressChange = (value: string) => {
+    setAddress(value);
+    // Clear recommendations if address changes
+    if (hasComputed) {
       setRecommendations([]);
       setHasComputed(false);
       setLastTaskContext('');
@@ -370,25 +427,57 @@ export default function SmartRecommender() {
       return;
     }
 
-    const finalTaskDescription = uploadedFile && uploadedFile.id
-      ? `Review permit file ${uploadedFile.id} - ${taskDescription}`
+    // Determine file ID from multiple sources
+    const effectiveFileId = hasFileId && manualFileId ? manualFileId : (uploadedFile?.id || undefined);
+    
+    const finalTaskDescription = effectiveFileId
+      ? `${taskDescription} (File: ${effectiveFileId})`
       : taskDescription;
 
     const assignedBy = localStorage.getItem('employeeCode') || '1030';
 
     const performAssignment = async () => {
       console.log(`[DEBUG] Assigning task to ${employee.employee_code}: ${finalTaskDescription}`);
+      console.log(`[DEBUG] File ID: ${effectiveFileId || 'none (standalone)'}`);
+      console.log(`[DEBUG] Tracking mode: ${effectiveFileId ? 'FILE_BASED' : 'STANDALONE'}`);
 
-      if (uploadedFile && uploadedFile.id) {
-        await assignTaskToEmployee(employee.employee_code, finalTaskDescription, assignedBy, uploadedFile.id);
-      } else {
-        await assignTaskToEmployee(employee.employee_code, finalTaskDescription, assignedBy);
-      }
+      const assignResult = await assignTaskToEmployee(
+        employee.employee_code,
+        finalTaskDescription,
+        assignedBy,
+        effectiveFileId,
+        assignmentMode === 'recommendation-only' ? 'smart' : 'manual'
+      );
 
+      const trackingMode = effectiveFileId ? 'FILE_BASED' : 'STANDALONE';
       toast({
         title: "Task Assigned!",
-        description: `Task assigned to ${employee.employee_name}${uploadedFile && uploadedFile.id ? ` for file ${uploadedFile.id}` : ''}`,
+        description: `${trackingMode} task assigned to ${employee.employee_name}${effectiveFileId ? ` for file ${effectiveFileId}` : ''}`,
       });
+
+      // Show duplicate assignment warning if same file already had active tasks
+      if ((assignResult as any)?.duplicate_warning) {
+        setTimeout(() => {
+          toast({
+            title: "⚠️ Duplicate Assignment Warning",
+            description: (assignResult as any).duplicate_warning,
+            variant: "destructive",
+            duration: 8000,
+          });
+        }, 1000);
+      }
+
+      // Dispatch event to notify other components (like TaskBoard)
+      window.dispatchEvent(new CustomEvent('task_assigned', {
+        detail: {
+          employeeCode: employee.employee_code,
+          employeeName: employee.employee_name,
+          taskDescription: finalTaskDescription,
+          fileId: effectiveFileId,
+          trackingMode: effectiveFileId ? 'FILE_BASED' : 'STANDALONE',
+          timestamp: new Date().toISOString()
+        }
+      }));
 
       const refreshPromises = [];
 
@@ -403,8 +492,8 @@ export default function SmartRecommender() {
     };
 
     try {
-      if (uploadedFile && uploadedFile.id) {
-        await runWithStageGating(uploadedFile.id, finalTaskDescription, performAssignment);
+      if (effectiveFileId) {
+        await runWithStageGating(effectiveFileId, finalTaskDescription, performAssignment);
       } else {
         await performAssignment();
       }
@@ -621,6 +710,17 @@ export default function SmartRecommender() {
         description: `File ${selectedFile.file_id} assigned to ${employee.employee_name}`,
       });
       
+      // Dispatch event to notify other components (like TaskBoard)
+      window.dispatchEvent(new CustomEvent('task_assigned', {
+        detail: {
+          employeeCode: employee.employee_code,
+          employeeName: employee.employee_name,
+          taskDescription: fileTaskDescription,
+          fileId: selectedFile.file_id,
+          timestamp: new Date().toISOString()
+        }
+      }));
+      
       // Show validation warning if present
       if ((result as any)?.validation_warning) {
         setTimeout(() => {
@@ -631,6 +731,18 @@ export default function SmartRecommender() {
             duration: 5000,
           });
         }, 1000);
+      }
+
+      // Show duplicate assignment warning if same file already had active tasks
+      if ((result as any)?.duplicate_warning) {
+        setTimeout(() => {
+          toast({
+            title: "⚠️ Duplicate Assignment Warning",
+            description: (result as any).duplicate_warning,
+            variant: "destructive",
+            duration: 8000,
+          });
+        }, 1500);
       }
 
       // Close dialog and reset
@@ -707,17 +819,68 @@ export default function SmartRecommender() {
     setEmployeeTaskCounts(taskCounts);
   };
 
-  const handleGetRecommendations = async () => {
+  const handleGetRecommendationsInternal = async (fileIdOverride?: string) => {
     console.log('🔍 handleGetRecommendations called');
     console.log('📝 Task description:', taskDescription);
     console.log('👥 Selected team:', selectedTeam?.team_lead_code);
-    
+    console.log('🎯 Assignment mode:', assignmentMode);
+    console.log('📁 uploadedFile:', uploadedFile);
+    console.log('📁 fileIdOverride:', fileIdOverride);
+
+    const effectiveFileId = fileIdOverride || uploadedFile?.id;
+    console.log('📎 effectiveFileId:', effectiveFileId);
+
+    // Validation: Task description
     if (!taskDescription.trim()) {
       toast({
-        title: "Please enter a task description",
+        title: "Task description required",
+        description: "Please enter a task description",
         variant: "destructive",
       });
       return;
+    }
+
+    // Validation: Task description length
+    if (taskDescription.trim().length < 10) {
+      toast({
+        title: "Task description too short",
+        description: "Please provide at least 10 characters for better recommendations",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Validation: Address format (if provided)
+    if (address && address.trim()) {
+      const zipMatch = address.match(/\b\d{5}\b/);
+      if (!zipMatch) {
+        toast({
+          title: "Invalid address format",
+          description: "Address must include a valid 5-digit ZIP code for team lead selection",
+          variant: "destructive",
+        });
+        return;
+      }
+    }
+
+    // Validation: File ID format (if provided)
+    if (hasFileId && manualFileId && manualFileId.trim()) {
+      const fileIdTrimmed = manualFileId.trim();
+      const validFormats = [
+        /^PF-\d{8}-[A-Z0-9]{8}$/,  // PF-20240219-ABC12345
+        /^FILE_\d+$/,               // FILE_12345
+        /^\d+$/                     // 12345
+      ];
+      
+      const isValidFormat = validFormats.some(pattern => pattern.test(fileIdTrimmed));
+      if (!isValidFormat) {
+        toast({
+          title: "Invalid file ID format",
+          description: "Expected formats: PF-YYYYMMDD-XXXXXXXX, FILE_XXXXX, or numeric ID",
+          variant: "destructive",
+        });
+        return;
+      }
     }
 
     // Remove file upload requirement for testing recommendations
@@ -726,27 +889,44 @@ export default function SmartRecommender() {
 
     setIsLoadingRecommendations(true);
     try {
-      // Use team lead filter to get team-specific recommendations
+      let recommendationsList: Recommendation[] = [];
+      let queryInfo: any = null;
+      
+      // Use regular recommendations for both modes (no PDF required)
       const response = await getEmployeeRecommendations(
         taskDescription,
         selectedTeam?.team_lead_code || null, // Use selected team lead code
         10,
-        0.3  // Lower threshold to get more matches
+        0.3,  // Lower threshold to get more matches
+        address || undefined,  // Pass address if provided
+        (hasFileId && manualFileId) ? manualFileId : undefined  // Pass file_id if provided
       );
+      recommendationsList = response.recommendations || [];
+      queryInfo = response.query_info;
+      console.log('✅ Got regular recommendations response:', response);
       
-      console.log('✅ Got recommendations:', response.length);
-      console.log('✅ Recommendations data:', response);
+      console.log('✅ Recommendations data:', recommendationsList);
 
-      setRecommendations(response);
+      // Extract team lead info from query_info
+      if (queryInfo) {
+        setResolvedTeamLead({
+          code: queryInfo.team_lead_code,
+          name: queryInfo.team_lead_name,
+          source: queryInfo.location_source
+        });
+        console.log('✅ Resolved team lead:', queryInfo.team_lead_name, '(', queryInfo.team_lead_code, ')');
+      }
+
+      setRecommendations(recommendationsList);
       setHasComputed(true);
       setLastTaskContext(taskDescription);
       
       // Switch to eligible employees tab to show recommendations
       setActiveTab("eligible-employees");
       
-      // Auto-assign to best employee (first recommendation)
-      if (response.length > 0) {
-        const bestEmployee = response[0];
+      // Auto-assign only if in auto-assign mode
+      if (assignmentMode === 'auto-assign' && recommendationsList.length > 0) {
+        const bestEmployee = recommendationsList[0];
         console.log(`🎯 Auto-assigning task to best employee: ${bestEmployee.employee_name} (${bestEmployee.employee_code})`);
         
         try {
@@ -765,6 +945,13 @@ export default function SmartRecommender() {
             variant: "destructive",
           });
         }
+      } else if (assignmentMode === 'recommendation-only') {
+        // Show success message for recommendation-only mode
+        const teamLeadInfo = queryInfo?.team_lead_name ? ` under ${queryInfo.team_lead_name}` : '';
+        toast({
+          title: "Recommendations Ready!",
+          description: `Found ${recommendationsList.length} recommended employees${teamLeadInfo}. Review and assign manually.`,
+        });
       }
       
       setStep('view-tasks');
@@ -779,74 +966,12 @@ export default function SmartRecommender() {
     }
   };
 
-  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) {
-      if (file.type !== 'application/pdf') {
-        toast({
-          title: "Invalid file type",
-          description: "Please select a PDF file",
-          variant: "destructive",
-        });
-        return;
-      }
-      setSelectedPdfFile(file);
-    }
-  };
-
-  const handleUploadFile = async () => {
-    if (!selectedPdfFile) {
-      toast({
-        title: "No file selected",
-        description: "Please select a PDF file to upload",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    if (!taskDescription.trim()) {
-      toast({
-        title: "Please enter a task description",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    setIsUploading(true);
-    try {
-      const assignedBy = localStorage.getItem('employeeCode') || '1030';
-
-      const result = (await smartUploadAndAssign(selectedPdfFile, taskDescription, assignedBy)) as SmartUploadAssignResult;
-
-      setUploadedFile({
-        id: result.file_id,
-        name: selectedPdfFile.name,
-      });
-
-      setAutoAssignedTeamLead(result.team_lead || null);
-      setAutoAssignedEmployee(result.employee || null);
-      setAutoAssignedTaskId(result.task_id || null);
-
-      toast({
-        title: result.resumed ? "Workflow Resumed" : "Uploaded + Assigned",
-        description: `File ${result.file_id} • Lead: ${result.team_lead_name || 'N/A'} • Employee: ${result.employee_name || 'N/A'}`,
-      });
-
-      setSelectedPdfFile(null);
-    } catch (error) {
-      toast({
-        title: "Upload/assignment failed",
-        description: error instanceof Error ? error.message : "Failed to upload/assign",
-        variant: "destructive",
-      });
-    } finally {
-      setIsUploading(false);
-    }
+  const handleGetRecommendations = async () => {
+    await handleGetRecommendationsInternal();
   };
 
   const handleRemoveFile = () => {
     setUploadedFile(null);
-    setSelectedPdfFile(null);
     setAutoAssignedTeamLead(null);
     setAutoAssignedEmployee(null);
     setAutoAssignedTaskId(null);
@@ -863,7 +988,6 @@ export default function SmartRecommender() {
     setSelectedTeam(null);
     setTaskDescription("");
     setUploadedFile(null);
-    setSelectedPdfFile(null);
     setRecommendations([]);
     setHasComputed(false);
     setLastTaskContext('');
@@ -915,19 +1039,19 @@ export default function SmartRecommender() {
             Smart Task Recommender
           </h1>
           <p className="text-lg text-muted-foreground">
-            Upload a PDF and enter a task description. Team lead and employee are auto-selected.
+            Enter task description and address to get AI-powered employee recommendations or auto-assign tasks.
           </p>
         </div>
 
-        {/* System-driven Upload + Assign */}
+        {/* System-driven Task Assignment */}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Upload className="h-5 w-5" />
-              Upload & Auto-Assign
+              <Sparkles className="h-5 w-5" />
+              Smart Task Assignment
             </CardTitle>
             <CardDescription>
-              State is detected from the first page of the PDF. Team lead selection is locked for the file lifetime.
+              Get AI-powered employee recommendations based on task description and project address.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -970,34 +1094,12 @@ export default function SmartRecommender() {
               </div>
             ) : (
               <div className="space-y-3">
-                <div
-                  className="border-2 border-dashed border-border rounded-lg p-6 text-center hover:border-primary/50 transition-colors cursor-pointer"
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  <Upload className="h-8 w-8 mx-auto mb-2 text-muted-foreground" />
-                  <p className="text-sm font-medium">
-                    {selectedPdfFile ? selectedPdfFile.name : "Click to select PDF file"}
-                  </p>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    or drag and drop your file here
-                  </p>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    id="permit-file-upload-root"
-                    name="permitFile"
-                    accept=".pdf"
-                    onChange={handleFileSelect}
-                    className="hidden"
-                  />
-                </div>
-
                 <div className="space-y-2">
-                  <Label>Task Description</Label>
+                  <Label>Task Description *</Label>
                   <Textarea
                     id="task-description-root"
                     name="taskDescription"
-                    placeholder="e.g., Electrical design review for AZ residential permit set"
+                    placeholder="e.g., QC, Electrical Design, Structural Review"
                     value={taskDescription}
                     onChange={(e) => handleTaskDescriptionChange(e.target.value)}
                     rows={3}
@@ -1005,29 +1107,144 @@ export default function SmartRecommender() {
                   />
                 </div>
 
-                {selectedPdfFile && (
-                  <Button
-                    onClick={handleUploadFile}
-                    disabled={isUploading || !taskDescription.trim()}
-                    className="w-full"
+                <div className="space-y-2">
+                  <Label>Project Address</Label>
+                  <Textarea
+                    placeholder="e.g., 182 Manchester Cir, Pittsburgh, PA 15237, USA"
+                    value={address}
+                    onChange={(e) => handleAddressChange(e.target.value)}
+                    rows={2}
+                    className="resize-none"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Optional: Helps improve employee recommendations based on location
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="checkbox"
+                      id="has-file-id"
+                      checked={hasFileId}
+                      onChange={(e) => {
+                        setHasFileId(e.target.checked);
+                        if (!e.target.checked) setManualFileId('');
+                      }}
+                      className="h-4 w-4 rounded border-gray-300"
+                    />
+                    <Label htmlFor="has-file-id" className="cursor-pointer">
+                      This task is associated with an existing file
+                    </Label>
+                  </div>
+                  
+                  {hasFileId && (
+                    <div className="space-y-2 pl-6">
+                      <Label>File ID</Label>
+                      <input
+                        type="text"
+                        placeholder="e.g., FILE_12345"
+                        value={manualFileId}
+                        onChange={(e) => setManualFileId(e.target.value)}
+                        className="w-full px-3 py-2 border rounded-md"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        File-based tasks will track through stages: PRELIMS → PRODUCTION → QC
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="flex items-center gap-2">
+                    <Settings className="h-4 w-4" />
+                    Assignment Mode
+                  </Label>
+                  <RadioGroup
+                    value={assignmentMode}
+                    onValueChange={(value: 'auto-assign' | 'recommendation-only') => setAssignmentMode(value)}
+                    className="flex flex-col space-y-2"
                   >
-                    {isUploading ? (
-                      <>
-                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                        Uploading & Assigning...
-                      </>
-                    ) : (
-                      <>
-                        <Upload className="h-4 w-4 mr-2" />
-                        Upload & Auto-Assign
-                      </>
-                    )}
-                  </Button>
-                )}
+                    <div className="flex items-center space-x-2 rounded-lg border p-3 hover:bg-accent/50 cursor-pointer">
+                      <RadioGroupItem value="auto-assign" id="auto-assign" />
+                      <Label htmlFor="auto-assign" className="flex-1 cursor-pointer">
+                        <div className="font-medium">Auto-Assign</div>
+                        <div className="text-sm text-muted-foreground">
+                          Automatically assign task to the best matching employee
+                        </div>
+                      </Label>
+                    </div>
+                    <div className="flex items-center space-x-2 rounded-lg border p-3 hover:bg-accent/50 cursor-pointer">
+                      <RadioGroupItem value="recommendation-only" id="recommendation-only" />
+                      <Label htmlFor="recommendation-only" className="flex-1 cursor-pointer">
+                        <div className="font-medium">Recommendation Only</div>
+                        <div className="text-sm text-muted-foreground">
+                          Get AI-powered recommendations and assign manually
+                        </div>
+                      </Label>
+                    </div>
+                  </RadioGroup>
+                </div>
+
+                <Button
+                  onClick={handleGetRecommendations}
+                  disabled={isLoadingRecommendations || !taskDescription.trim()}
+                  className="w-full"
+                >
+                  {isLoadingRecommendations ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      Finding Best Employee...
+                    </>
+                  ) : (
+                    <>
+                      <Search className="h-4 w-4 mr-2" />
+                      {assignmentMode === 'auto-assign' ? 'Find & Auto-Assign Employee' : 'Get Recommendations'}
+                    </>
+                  )}
+                </Button>
               </div>
             )}
           </CardContent>
         </Card>
+
+        {/* Display Resolved Team Lead Info */}
+        {resolvedTeamLead && resolvedTeamLead.name && (
+          <Card className="border-primary/30 bg-primary/5">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Users className="h-5 w-5 text-primary" />
+                Team Lead Selected
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-muted-foreground">Team Lead:</span>
+                <span className="font-medium">{resolvedTeamLead.name}</span>
+              </div>
+              {resolvedTeamLead.code && (
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Code:</span>
+                  <span className="font-mono text-sm">{resolvedTeamLead.code}</span>
+                </div>
+              )}
+              {resolvedTeamLead.source && (
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Source:</span>
+                  <Badge variant="outline" className="text-xs">
+                    {resolvedTeamLead.source === 'address_zip_range_mapping' ? 'Address-based' : 
+                     resolvedTeamLead.source === 'permit_file' ? 'File-based' :
+                     resolvedTeamLead.source === 'default_team_lead' ? 'Default' : 
+                     resolvedTeamLead.source}
+                  </Badge>
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground mt-2">
+                Employees shown below report to this team lead
+              </p>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Team Leads Grid (Monitoring Only) */}
         {isLoading ? (
@@ -1125,90 +1342,12 @@ export default function SmartRecommender() {
         </Card>
       )}
 
-      {/* File Upload Section */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Upload className="h-5 w-5" />
-            Upload Permit File (Optional)
-          </CardTitle>
-          <CardDescription>
-            Upload a PDF file to associate with this task assignment
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {uploadedFile ? (
-            <div className="flex items-center justify-between p-4 rounded-lg border border-success bg-success/10">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-lg bg-success/20 flex items-center justify-center">
-                  <FileText className="h-5 w-5 text-success" />
-                </div>
-                <div>
-                  <p className="font-medium text-sm">{uploadedFile.name}</p>
-                  <p className="text-xs text-muted-foreground">File ID: {uploadedFile.id}</p>
-                </div>
-              </div>
-              <Button variant="ghost" size="sm" onClick={handleRemoveFile}>
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <div 
-                className="border-2 border-dashed border-border rounded-lg p-6 text-center hover:border-primary/50 transition-colors cursor-pointer"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <Upload className="h-8 w-8 mx-auto mb-2 text-muted-foreground" />
-                <p className="text-sm font-medium">
-                  {selectedPdfFile ? selectedPdfFile.name : "Click to select PDF file"}
-                </p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  or drag and drop your file here
-                </p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  id="permit-file-upload"
-                  name="permitFile"
-                  accept=".pdf"
-                  onChange={handleFileSelect}
-                  className="hidden"
-                />
-              </div>
-              
-              
-              
-              {selectedPdfFile && (
-                <Button 
-                  onClick={handleUploadFile} 
-                  disabled={isUploading}
-                  className="w-full"
-                >
-                  {isUploading ? (
-                    <>
-                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      Uploading...
-                    </>
-                  ) : (
-                    <>
-                      <Upload className="h-4 w-4 mr-2" />
-                      Upload File
-                    </>
-                  )}
-                </Button>
-              )}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
       {/* Task Input */}
       <Card variant="glow">
         <CardHeader>
           <CardTitle>Task Description</CardTitle>
           <CardDescription>
             Describe the task you want to assign to team members
-            {uploadedFile && <span className="text-success"> · File {uploadedFile.id} will be referenced</span>}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -1224,66 +1363,30 @@ export default function SmartRecommender() {
           <div className="flex gap-2">
             <Button 
               onClick={handleGetRecommendations}
-              disabled={!taskDescription.trim() || isLoadingRecommendations}
+              disabled={
+                !taskDescription.trim() ||
+                isLoadingRecommendations
+              }
               variant="outline"
-              title="Find eligible employees based on task description"
+              title={
+                assignmentMode === 'auto-assign'
+                  ? 'Find and auto-assign to best employee'
+                  : 'Get AI-powered recommendations'
+              }
             >
               <Search className="h-4 w-4 mr-2" />
-              {isLoadingRecommendations ? "Finding..." : "Find Eligible Employees"}
+              {isLoadingRecommendations 
+                ? "Finding..." 
+                : assignmentMode === 'auto-assign' 
+                  ? "Find & Auto-Assign" 
+                  : "Get Recommendations"
+              }
             </Button>
           </div>
         </CardContent>
       </Card>
 
-      {/* Quick Access - Unassigned Files Button */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <FolderOpen className="h-5 w-5" />
-              Quick Access
-            </div>
-          </CardTitle>
-          <CardDescription>
-            Quick tools for testing and managing file assignments
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <Button 
-            onClick={() => setShowUnassignedFiles(!showUnassignedFiles)}
-            variant="outline" 
-            className="w-full justify-start"
-          >
-            <FolderOpen className="h-4 w-4 mr-2" />
-            View Unassigned Files ({Array.isArray(unassignedFiles) ? unassignedFiles.length : 0})
-            <ChevronDown className={`h-4 w-4 ml-auto transition-transform ${showUnassignedFiles ? 'rotate-180' : ''}`} />
-          </Button>
-          
-          <Button 
-            onClick={() => {
-              // Set a sample task description for testing
-              setTaskDescription("Quality control review of electrical plan sets for residential solar installation including panel layout and wiring diagrams");
-              // Switch to eligible employees tab
-              setActiveTab("eligible-employees");
-              // Show unassigned files if not already shown
-              if (!showUnassignedFiles) {
-                setShowUnassignedFiles(true);
-              }
-            }}
-            variant="outline" 
-            className="w-full justify-start"
-          >
-            <Play className="h-4 w-4 mr-2" />
-            Test Recommendation System
-          </Button>
-          
-          <p className="text-xs text-muted-foreground">
-            • Click "View Unassigned Files" to see all files needing assignment<br/>
-            • Click "Test Recommendation System" to auto-fill sample task and test recommendations
-          </p>
-        </CardContent>
-      </Card>
-
+      
       {/* Expandable Unassigned Files Section */}
       {showUnassignedFiles && (
         <Card className="border-primary/20">
@@ -1341,9 +1444,17 @@ export default function SmartRecommender() {
                         <p className="text-sm font-medium truncate">{file.file_name || 'Permit file'}</p>
                       </div>
                       <div className="flex items-center gap-2 text-xs">
-                        <Badge variant="secondary" className="text-xs">
+                        <Badge 
+                          variant={file.current_stage === 'COMPLETED' || file.current_stage === 'DELIVERED' ? "destructive" : "secondary"} 
+                          className="text-xs"
+                        >
                           {file.current_stage || file.workflow_step || 'PRELIMS'}
                         </Badge>
+                        {file.current_stage === 'COMPLETED' || file.current_stage === 'DELIVERED' ? (
+                          <Badge variant="outline" className="text-xs text-orange-600 border-orange-600">
+                            ⚠ Already Completed
+                          </Badge>
+                        ) : null}
                         <Badge variant="outline" className="text-xs">
                           {file.client || 'Unassigned'}
                         </Badge>

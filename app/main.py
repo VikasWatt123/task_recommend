@@ -6,6 +6,10 @@ from pymongo import MongoClient
 import logging
 import asyncio
 
+# Import MySQL integration services
+from app.services.sql_sync_service import sync_service
+from app.services.backup_sync_service import backup_sync_service
+
 # Configure essential logging
 logging.basicConfig(
     level=logging.INFO,
@@ -18,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 # Set specific loggers to INFO/ERROR to reduce noise
 logging.getLogger("app").setLevel(logging.INFO)
+logging.getLogger("app.services.stage_tracking_service").setLevel(logging.DEBUG)
+logging.getLogger("app.services.stage_assignment_service").setLevel(logging.DEBUG)
+logging.getLogger("app.api.v1.routers.tasks").setLevel(logging.DEBUG)
+logging.getLogger("app.api.v1.routers.employee_assignment").setLevel(logging.DEBUG)
+logging.getLogger("app.api.v1.routers.stage_tracking").setLevel(logging.DEBUG)
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("fastapi").setLevel(logging.WARNING)
@@ -29,13 +38,22 @@ logging.getLogger("pymongo.topology").setLevel(logging.WARNING)
 
 app = FastAPI(title=settings.app_name, version="1.0.0")
 
-# CORS middleware
+# CORS middleware - Explicitly allow localhost origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "*"  # Fallback for development
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # Create uploads directory
@@ -82,6 +100,26 @@ async def startup_event():
         # Capture the main event loop for thread-safe async dispatch (SLA emissions, WebSocket-safe patterns)
         from app.services.clickhouse_service import clickhouse_service
         clickhouse_service.set_main_event_loop(asyncio.get_running_loop())
+        
+        # Initialize MySQL integration
+        logger.info("🔗 Initializing MySQL integration...")
+        try:
+            await sql_sync_service.initialize()
+            logger.info("✅ MySQL sync service initialized")
+            
+            # Test MySQL connection
+            if sql_sync_service.mysql_service.test_mysql_connection():
+                logger.info("✅ MySQL connection successful")
+                
+                # Start backup sync service
+                asyncio.create_task(backup_sync_service.start_periodic_sync())
+                logger.info("✅ Backup sync service started")
+            else:
+                logger.error("❌ MySQL connection failed")
+                
+        except Exception as e:
+            logger.error(f"❌ MySQL integration failed: {e}")
+            logger.warning("⚠️  Continuing without MySQL integration")
         
         # Start sync worker in background
         asyncio.create_task(sync_service.start_sync_worker())
@@ -132,6 +170,11 @@ from app.api.v1.routers.employee_assignment import router as employee_assignment
 from app.api.v1.routers.permit_reports import router as permit_reports_router
 from app.api.v1.routers.analytics import router as analytics_router
 from app.api.v1.routers.zip_assign import router as zip_assign_router
+from app.api.v1.routers.file_lifecycle import router as file_lifecycle_router
+# Add webhook router for SQL integration
+from app.api.v1.routers.webhooks import router as webhooks_router
+# Add MySQL admin router
+from app.api.v1.routers.mysql_admin import router as mysql_admin_router
 
 # Add automation router (now integrated with existing flow)
 from app.api.v1.routers.automation import router as automation_router
@@ -147,6 +190,10 @@ from app.api.v1.routers.frontend_compat import router as frontend_compat_router
 # Temporal routers commented out temporarily
 # logger.info("🔥 Including temporal_integration router...")
 # app.include_router(temporal_integration_router, prefix="/api/v1")
+
+# Need to add this import
+from app.services.sql_sync_service import SQLToMongoSyncService
+sql_sync_service = SQLToMongoSyncService()
 
 logger.info("🔥 Including websockets router...")
 app.include_router(websockets_router, prefix="/api/v1")
@@ -164,6 +211,8 @@ logger.info("🔥 Including ZIP-based assignment router...")
 app.include_router(zip_assign_router, prefix="/api/v1")
 logger.info("🔥 Including permit files router...")
 app.include_router(permit_files_router, prefix="/api/v1")
+logger.info("🔥 Including file lifecycle router...")
+app.include_router(file_lifecycle_router, prefix="/api/v1")
 logger.info("🔥 Including tasks router...")
 app.include_router(tasks_router, prefix="/api/v1")
 logger.info("🔥 Including employee assignment router...")
@@ -182,6 +231,10 @@ logger.info("🔥 Including automation router...")
 app.include_router(automation_router, prefix="/api/v1")
 logger.info("🔥 Including analytics router (ClickHouse)...")
 app.include_router(analytics_router, prefix="/api/v1")
+logger.info("🔥 Including webhook router for SQL integration...")
+app.include_router(webhooks_router, prefix="/api/v1")
+logger.info("🔥 Including MySQL admin router...")
+app.include_router(mysql_admin_router, prefix="/api/v1")
 logger.info("🔥 Including frontend compatibility router...")
 app.include_router(frontend_compat_router, prefix="/api/v1")
 # Temporal routers commented out temporarily
@@ -199,3 +252,8 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "mode": "mongodb", "database": settings.mongodb_db}
+
+@app.get("/api/v1/cors-test")
+async def cors_test():
+    """Test endpoint to verify CORS is working"""
+    return {"message": "CORS test successful", "timestamp": "2026-02-20T10:00:00Z"}

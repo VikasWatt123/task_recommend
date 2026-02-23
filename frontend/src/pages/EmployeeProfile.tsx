@@ -174,7 +174,8 @@ export default function EmployeeProfile() {
           }
           
           if (tasksData.status === 'fulfilled') {
-            setAssignedTasks(tasksData.value.tasks || []);
+            const td = tasksData.value as any;
+            setAssignedTasks(td.assigned_tasks || td.tasks || []);
           } else {
             console.error('❌ Failed to load tasks:', tasksData.reason);
           }
@@ -186,7 +187,8 @@ export default function EmployeeProfile() {
           }
           
           if (completedData.status === 'fulfilled') {
-            setCompletedTasks(completedData.value.tasks || []);
+            const cd = completedData.value as any;
+            setCompletedTasks(cd.completed_tasks || cd.tasks || []);
           } else {
             console.error('❌ Failed to load completed tasks:', completedData.reason);
           }
@@ -230,7 +232,8 @@ export default function EmployeeProfile() {
         }
         
         if (tasksData.status === 'fulfilled') {
-          setAssignedTasks(tasksData.value.tasks || []);
+          const td = tasksData.value as any;
+          setAssignedTasks(td.assigned_tasks || td.tasks || []);
         }
         
         if (statsData.status === 'fulfilled') {
@@ -241,7 +244,8 @@ export default function EmployeeProfile() {
         }
         
         if (completedData.status === 'fulfilled') {
-          setCompletedTasks(completedData.value.tasks || []);
+          const cd = completedData.value as any;
+          setCompletedTasks(cd.completed_tasks || cd.tasks || []);
         }
       } catch (error) {
         console.error('Error refreshing data:', error);
@@ -603,7 +607,7 @@ export default function EmployeeProfile() {
                   return (
                     <div key={idx} className="flex items-start justify-between p-4 rounded-lg bg-secondary/50 border border-border">
                       <div className="flex-1">
-                        <p className="font-medium">{task.task_assigned || task.task_description}</p>
+                        <p className="font-medium">{(task as any).title || task.task_assigned || task.task_description || 'Unnamed Task'}</p>
                         {task.original_filename && task.original_filename !== "General Task" && (
                           <div className="flex items-center gap-2 mt-2">
                             <Badge variant="outline" className="text-xs bg-blue-50 border-blue-200">

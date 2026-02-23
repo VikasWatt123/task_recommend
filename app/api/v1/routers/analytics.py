@@ -291,6 +291,101 @@ async def compare_mongodb_clickhouse():
         logger.error(f"Failed to compare databases: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/employee/{employee_code}/summary")
+async def get_employee_summary(employee_code: str):
+    """
+    Get employee task summary statistics (MongoDB-based)
+    Provides overview of employee performance and workload
+    """
+    try:
+        db = get_db()
+        
+        # Get employee info
+        employee = db.employee.find_one({"kekaemployeenumber": employee_code})
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        
+        # Get all completed tasks
+        completed_tasks = list(db.tasks.find({
+            "assigned_to": employee_code,
+            "status": "COMPLETED"
+        }))
+        
+        # Get all tasks (any status)
+        all_tasks = list(db.tasks.find({
+            "assigned_to": employee_code
+        }))
+        
+        # Calculate statistics
+        total_tasks = len(all_tasks)
+        total_completed = len(completed_tasks)
+        
+        # Calculate total hours worked
+        total_hours = sum(
+            task.get("employee_hours_worked", 0) 
+            for task in completed_tasks 
+            if task.get("employee_hours_worked")
+        )
+        
+        # Calculate average duration
+        avg_duration = (total_hours / total_completed) if total_completed > 0 else 0
+        
+        # Group by stage
+        tasks_by_stage = {}
+        for task in completed_tasks:
+            stage = task.get("stage", "UNKNOWN")
+            tasks_by_stage[stage] = tasks_by_stage.get(stage, 0) + 1
+        
+        # Group by tracking mode
+        tasks_by_mode = {}
+        for task in all_tasks:
+            mode = task.get("tracking_mode", "FILE_BASED")  # Default for backward compatibility
+            tasks_by_mode[mode] = tasks_by_mode.get(mode, 0) + 1
+        
+        # Get recent completions (last 10)
+        recent_completions = sorted(
+            completed_tasks,
+            key=lambda x: x.get("completed_at", datetime.min),
+            reverse=True
+        )[:10]
+        
+        recent_list = []
+        for task in recent_completions:
+            recent_list.append({
+                "task_id": task.get("task_id"),
+                "title": task.get("title"),
+                "file_id": task.get("file_id"),
+                "stage": task.get("stage"),
+                "tracking_mode": task.get("tracking_mode", "FILE_BASED"),
+                "completed_at": task.get("completed_at").isoformat() if task.get("completed_at") else None,
+                "hours_worked": task.get("employee_hours_worked", 0)
+            })
+        
+        return {
+            "success": True,
+            "employee_code": employee_code,
+            "employee_name": employee.get("employee_name"),
+            "summary": {
+                "total_tasks": total_tasks,
+                "total_completed": total_completed,
+                "total_in_progress": total_tasks - total_completed,
+                "total_hours_worked": round(total_hours, 2),
+                "average_task_duration_hours": round(avg_duration, 2),
+                "completion_rate": round((total_completed / total_tasks * 100), 2) if total_tasks > 0 else 0
+            },
+            "tasks_by_stage": tasks_by_stage,
+            "tasks_by_tracking_mode": tasks_by_mode,
+            "recent_completions": recent_list,
+            "source": "mongodb"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get employee summary for {employee_code}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/sync/assignment-to-dashboard")
 async def sync_assignment_to_dashboard(task_id: str = None, file_id: str = None):
     """

@@ -20,7 +20,8 @@ import {
   ArrowLeft,
   X
 } from 'lucide-react';
-import { getStageTrackingDashboard } from '@/lib/api';
+import { getStageTrackingDashboard, manualSyncMongoToClickhouse, clearStageTrackingCache } from "@/lib/api";
+import { toast } from "@/hooks/use-toast";
 import { 
   FileStage, 
   PipelineData, 
@@ -50,6 +51,7 @@ const StageTrackingDashboard: React.FC = () => {
   const [slaBreaches, setSlaBreaches] = useState<SLABreach[]>([]);
   const [stageConfigs, setStageConfigs] = useState<StageConfig[]>([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [selectedStage, setSelectedStage] = useState<string>('all');
   const [permitFiles, setPermitFiles] = useState<PermitFile[]>([]);
   const [selectedStageFiles, setSelectedStageFiles] = useState<{stage: string, files: FileStage[]} | null>(null);
@@ -74,9 +76,36 @@ const StageTrackingDashboard: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  const fetchData = async (showLoading = true) => {
+  const fetchData = async (showLoading = true, performManualSync = false) => {
     try {
       if (showLoading) setLoading(true);
+      if (performManualSync) setSyncing(true);
+
+      // Perform manual sync if requested
+      if (performManualSync) {
+        try {
+          const syncResult = await manualSyncMongoToClickhouse();
+          console.log('[Stage Tracking] Manual sync completed:', syncResult);
+          
+          // Show success toast
+          toast({
+            title: "Sync Completed",
+            description: `Synced ${syncResult.synced_files} files, ${syncResult.breached_files} breaches detected`,
+            variant: "default"
+          });
+        } catch (syncError) {
+          console.error('[Stage Tracking] Manual sync failed:', syncError);
+          
+          // Show error toast
+          toast({
+            title: "Sync Failed",
+            description: syncError instanceof Error ? syncError.message : "Unknown error occurred",
+            variant: "destructive"
+          });
+        } finally {
+          setSyncing(false);
+        }
+      }
 
       const dashboard = await getStageTrackingDashboard();
       const pipeline: PipelineData = dashboard?.data?.pipeline || { PRELIMS: [], PRODUCTION: [], COMPLETED: [], QC: [], DELIVERED: [] };
@@ -299,6 +328,20 @@ const StageTrackingDashboard: React.FC = () => {
   const renderStageColumn = (stage: string, files: FileStage[]) => {
     const stageConfig = stageConfigs.find(c => c.stage === stage);
     const stageBreaches = slaBreaches.filter(b => b.current_stage === stage);
+    const fileMap = new Map<string, FileStage>();
+    files.forEach((file) => {
+      const existing = fileMap.get(file.file_id);
+      if (!existing) {
+        fileMap.set(file.file_id, file);
+        return;
+      }
+      const existingTime = Date.parse(existing.updated_at || '') || 0;
+      const candidateTime = Date.parse(file.updated_at || '') || 0;
+      if (candidateTime >= existingTime) {
+        fileMap.set(file.file_id, file);
+      }
+    });
+    const dedupedFiles = Array.from(fileMap.values());
     
     return (
       <div key={stage} className="flex-1 min-w-0">
@@ -310,7 +353,7 @@ const StageTrackingDashboard: React.FC = () => {
                 {stage}
               </div>
               <div className="flex items-center gap-2">
-                <Badge variant="outline">{files.length}</Badge>
+                <Badge variant="outline">{dedupedFiles.length}</Badge>
                 {stageBreaches.length > 0 && (
                   <Badge variant="destructive">
                     <AlertTriangle className="w-3 h-3 mr-1" />
@@ -329,13 +372,13 @@ const StageTrackingDashboard: React.FC = () => {
           </CardHeader>
           <CardContent className="pt-0">
             <div className="space-y-2 max-h-96 overflow-y-auto">
-              {files.length === 0 ? (
+              {dedupedFiles.length === 0 ? (
                 <div className="text-center text-gray-500 py-8">
                   <FileText className="w-8 h-8 mx-auto mb-2 opacity-50" />
                   <p className="text-sm">No files in this stage</p>
                 </div>
               ) : (
-                files.map(file => renderFileCard(file, stage))
+                dedupedFiles.map(file => renderFileCard(file, stage))
               )}
             </div>
           </CardContent>
@@ -371,9 +414,18 @@ const StageTrackingDashboard: React.FC = () => {
             <p className="text-gray-600">Monitor file progress through workflow stages</p>
           </div>
         </div>
-        <Button onClick={() => fetchData(true)} variant="outline" size="sm">
-          <Activity className="w-4 h-4 mr-2" />
-          Refresh
+        <Button onClick={() => fetchData(true, true)} variant="outline" size="sm" disabled={syncing}>
+          {syncing ? (
+            <>
+              <div className="w-4 h-4 mr-2 animate-spin rounded-full border-2 border-gray-300 border-t-blue-600"></div>
+              Syncing...
+            </>
+          ) : (
+            <>
+              <Activity className="w-4 h-4 mr-2" />
+              Refresh & Sync
+            </>
+          )}
         </Button>
       </div>
 

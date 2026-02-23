@@ -37,7 +37,7 @@ def generate_file_id():
 
 # Team lead to state mapping (from existing permit_files.py)
 TEAM_LEAD_STATE_MAP: Dict[str, List[str]] = {
-    "MA": ["Rahul (0081)", "Tanveer Alam (0067)"],
+    "MA": ["Rahul (0081)", "Tanweer Alam (0067)"],
     "RI": ["Rahul (0081)"],
     "FL": ["Gaurav Mavi (0146)"],
     "GA": ["Gaurav Mavi (0146)"],
@@ -51,8 +51,8 @@ TEAM_LEAD_STATE_MAP: Dict[str, List[str]] = {
     "IL": ["Prashant Sharma (0079)"],
     "TX": ["Saurav Yadav (0119)"],
     "CA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)"],
-    "PA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)", "Tanveer Alam (0067)"],
-    "MD": ["Tanveer Alam (0067)"],
+    "PA": ["Shivam Kumar (0083)", "Rohan Kashid (0902)", "Sunder Raj D (0462)", "Tanweer Alam (0067)"],
+    "MD": ["Tanweer Alam (0067)"],
 }
 
 # State to ZIP range mapping
@@ -172,50 +172,57 @@ def _ocr_first_page_text(pdf_bytes: bytes) -> Optional[str]:
         return None
 
 def _extract_zip_from_pdf_first_page(pdf_bytes: bytes) -> Optional[str]:
-    """Extract first 5-digit ZIP code from PDF first page."""
+    """Extract first 5-digit ZIP code from PDF first 3 pages."""
     if not pdf_bytes:
         return None
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if not reader.pages:
             return None
-        # Try default extraction; if empty, try layout mode (helps some PDFs)
-        page0 = reader.pages[0]
-        text = (page0.extract_text() or "").strip()
-        if not text:
-            try:
-                text = (page0.extract_text(extraction_mode="layout") or "").strip()
-            except TypeError:
-                # Older pypdf versions may not support extraction_mode
-                pass
+        
+        # Extract text from first 3 pages (or fewer if PDF has less pages)
+        all_text = ""
+        max_pages = min(3, len(reader.pages))
+        
+        for i in range(max_pages):
+            page = reader.pages[i]
+            # Try default extraction; if empty, try layout mode
+            page_text = (page.extract_text() or "").strip()
+            if not page_text:
+                try:
+                    page_text = (page.extract_text(extraction_mode="layout") or "").strip()
+                except TypeError:
+                    # Older pypdf versions may not support extraction_mode
+                    pass
+            all_text += page_text + " "
+            
+            # If we found a ZIP in current page, no need to check more pages
+            if page_text:
+                normalized = _normalize_extracted_text(page_text)
+                candidates = _extract_zip_candidates(normalized)
+                if candidates:
+                    zip_code = candidates[0]
+                    logger.info(f"[ZIP ASSIGN] Extracted ZIP from page {i+1}: {zip_code}")
+                    return zip_code
+        
+        # If no ZIP found in individual pages, try searching all pages combined
+        normalized = _normalize_extracted_text(all_text)
+        logger.info(f"[ZIP ASSIGN] Combined text from {max_pages} pages length: {len(normalized)}")
+        logger.info(f"[ZIP ASSIGN] Combined text preview: {normalized[:350]}...")
+        
+        candidates = _extract_zip_candidates(normalized)
+        logger.info(f"[ZIP ASSIGN] ZIP candidates found: {candidates}")
+        if not candidates:
+            logger.warning("[ZIP ASSIGN] No ZIP candidates found in extracted text")
+            return None
+
+        zip_code = candidates[0]
+        logger.info(f"[ZIP ASSIGN] Extracted ZIP from combined pages: {zip_code}")
+        return zip_code
+        
     except Exception as e:
         logger.error(f"[ZIP ASSIGN] PDF parsing failed: {e}")
         return None
-
-    # OCR fallback (only when pypdf extracted no text)
-    if not text:
-        logger.warning("[ZIP ASSIGN] No text extracted from PDF first page. Attempting OCR fallback...")
-        ocr_text = _ocr_first_page_text(pdf_bytes)
-        if ocr_text:
-            text = ocr_text
-            logger.info("[ZIP ASSIGN] OCR extracted text from first page")
-        else:
-            logger.warning("[ZIP ASSIGN] OCR not available or failed; cannot extract ZIP")
-            return None
-
-    normalized = _normalize_extracted_text(text)
-    logger.info(f"[ZIP ASSIGN] First page text length: {len(normalized)}")
-    logger.info(f"[ZIP ASSIGN] First page text preview: {normalized[:350]}...")
-
-    candidates = _extract_zip_candidates(normalized)
-    logger.info(f"[ZIP ASSIGN] ZIP candidates found: {candidates}")
-    if not candidates:
-        logger.warning("[ZIP ASSIGN] No ZIP candidates found in extracted text")
-        return None
-
-    zip_code = candidates[0]
-    logger.info(f"[ZIP ASSIGN] Extracted ZIP: {zip_code}")
-    return zip_code
 
 def _validate_zip_and_get_state(zip_code: str) -> Optional[str]:
     """Validate ZIP and return state code if valid."""

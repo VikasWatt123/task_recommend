@@ -33,6 +33,11 @@ class SkillNormalizer:
             'electrical drawing', 'single line diagram', 'three line diagram',
             'conduit sizing', 'wire sizing', 'voltage drop calculation'
         ],
+        'quality_control': [
+            'quality', 'quality control', 'quality assurance', 'qa', 'qc',
+            'review', 'inspection', 'testing', 'audit', 'check', 'verification',
+            'validation', 'compliance', 'quality & compliance'
+        ],
         'coordination': [
             'coordination', 'project coordination', 'project management',
             'team management', 'team leadership', 'leadership', 'management'
@@ -77,7 +82,8 @@ class SkillNormalizer:
         categorized = {
             'structural_design': [],
             'electrical_design': [],
-            'coordination': []
+            'coordination': [],
+            'quality_control': []  # Add QC category
         }
         
         # Check each skill category

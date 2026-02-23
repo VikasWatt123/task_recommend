@@ -94,7 +94,7 @@ class FileTracking(BaseModel):
 
 class StageTransitionRequest(BaseModel):
     """Request to transition a file to a new stage"""
-    file_id: str
+    permit_file_id: str
     target_stage: FileStage
     employee_code: str
     notes: Optional[str] = None
@@ -103,14 +103,14 @@ class StageTransitionRequest(BaseModel):
 
 class StageAssignmentRequest(BaseModel):
     """Assign an employee to work on current stage"""
-    file_id: str
+    permit_file_id: str
     employee_code: str
     notes: Optional[str] = None
 
 
 class StageCompletionRequest(BaseModel):
     """Mark current stage as completed"""
-    file_id: str
+    permit_file_id: str
     employee_code: str
     completion_notes: Optional[str] = None
     next_stage_employee_code: Optional[str] = None  # Auto-assign to next stage
@@ -220,8 +220,10 @@ def complete_current_stage(tracking: FileTracking, completion_notes: Optional[st
     # Update stage history
     current_stage_history.completed_stage_at = now
     current_stage_history.status = "COMPLETED"
-    if tracking.current_assignment.duration_minutes:
+    if tracking.current_assignment.duration_minutes is not None:
         current_stage_history.total_duration_minutes = tracking.current_assignment.duration_minutes
+    else:
+        current_stage_history.total_duration_minutes = 0
     
     tracking.updated_at = datetime.utcnow()
     return tracking

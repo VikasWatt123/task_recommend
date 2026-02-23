@@ -96,6 +96,10 @@ def get_next_stage(current_stage: FileStage) -> Optional[FileStage]:
         FileStage.DELIVERED
     ]
     
+    # Special case: if current stage is QC, next should be DELIVERED
+    if current_stage == FileStage.QC:
+        return FileStage.DELIVERED
+    
     try:
         current_index = stage_order.index(current_stage)
         if current_index < len(stage_order) - 1:

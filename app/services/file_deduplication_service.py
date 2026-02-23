@@ -26,10 +26,11 @@ class FileDeduplicationService:
         """
         Find existing file by content hash, size, and name
         Returns the file_id if found, None otherwise
+        Priority: Content hash > Filename + Size > Size only
         """
         db = get_db()
         
-        # First try to find by hash (most reliable)
+        # First try to find by hash (most reliable - exact same file)
         existing = db.permit_files.find_one({
             'file_hash': file_hash
         })
@@ -37,16 +38,147 @@ class FileDeduplicationService:
             logger.info(f"Found existing file by hash: {existing.get('file_id')}")
             return existing.get('file_id')
         
+        # Second: try to find by filename (same project, possibly updated)
+        # Check exact filename match first
+        existing = db.permit_files.find_one({
+            'file_info.original_filename': file_name
+        })
+        if existing:
+            logger.info(f"Found existing file by exact filename: {existing.get('file_id')} - Same project detected")
+            return existing.get('file_id')
+        
+        # Third: try case-insensitive filename match
+        existing = db.permit_files.find_one({
+            'file_info.original_filename': {'$regex': f'^{file_name}$', '$options': 'i'}
+        })
+        if existing:
+            logger.info(f"Found existing file by case-insensitive filename: {existing.get('file_id')} - Same project detected")
+            return existing.get('file_id')
+        
+        # Fourth: try filename pattern matching (handles minor variations)
+        # Extract base name without common suffixes
+        base_name = file_name.replace('.pdf', '').replace(' ', '_').replace('-', '_').lower()
+        base_name = base_name.replace('_v1', '').replace('_v2', '').replace('_v3', '').replace('_v4', '').replace('_v5', '')
+        base_name = base_name.replace('_rev1', '').replace('_rev2', '').replace('_rev3', '')
+        
+        # Pattern match for similar names
+        existing = db.permit_files.find_one({
+            'file_info.original_filename': {
+                '$regex': base_name.replace('_', '[-_ ]?'),
+                '$options': 'i'
+            }
+        })
+        if existing:
+            logger.info(f"Found existing file by filename pattern: {existing.get('file_id')} - Similar project detected")
+            return existing.get('file_id')
+        
         # Fallback: try to find by size and name pattern
         existing = db.permit_files.find_one({
             'file_size': file_size,
-            'file_name': file_name
+            'file_info.original_filename': {'$regex': file_name.replace(' ', '.*'), '$options': 'i'}
         })
         if existing:
-            logger.info(f"Found existing file by size/name: {existing.get('file_id')}")
+            logger.info(f"Found existing file by size/name pattern: {existing.get('file_id')}")
             return existing.get('file_id')
         
         return None
+    
+    @staticmethod
+    def track_file_version(existing_file_id: str, new_file_hash: str, upload_info: dict) -> bool:
+        """
+        Track a new version of an existing file (same name, different content)
+        Creates a version history entry while maintaining the same file_id
+        """
+        db = get_db()
+        
+        try:
+            # Get existing file
+            existing = db.permit_files.find_one({'file_id': existing_file_id})
+            if not existing:
+                return False
+            
+            # Initialize version history if not exists
+            if not existing.get('version_history'):
+                db.permit_files.update_one(
+                    {'file_id': existing_file_id},
+                    {'$set': {'version_history': []}}
+                )
+            
+            # Add new version entry
+            version_entry = {
+                'version_number': len(existing.get('version_history', [])) + 1,
+                'file_hash': new_file_hash,
+                'uploaded_at': upload_info.get('uploaded_at', datetime.utcnow()),
+                'uploaded_by': upload_info.get('uploaded_by'),
+                'file_size': upload_info.get('file_size'),
+                'change_reason': upload_info.get('change_reason', 'File updated')
+            }
+            
+            # Update version history
+            db.permit_files.update_one(
+                {'file_id': existing_file_id},
+                {
+                    '$push': {'version_history': version_entry},
+                    '$set': {
+                        'file_hash': new_file_hash,
+                        'file_info.file_size': upload_info.get('file_size'),
+                        'file_info.uploaded_at': upload_info.get('uploaded_at'),
+                        'metadata.updated_at': datetime.utcnow()
+                    }
+                }
+            )
+            
+            logger.info(f"Tracked new version for file {existing_file_id}: version {version_entry['version_number']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error tracking file version: {e}")
+            return False
+    
+    @staticmethod
+    def get_file_lifecycle(file_id: str) -> dict:
+        """
+        Get complete lifecycle information for a file including all versions and stages
+        """
+        db = get_db()
+        
+        # Get file info
+        file_doc = db.permit_files.find_one({'file_id': file_id}, {'_id': 0})
+        if not file_doc:
+            return {}
+        
+        # Get stage tracking
+        tracking = db.file_tracking.find_one({'file_id': file_id}, {'_id': 0})
+        
+        # Get all tasks with employee details
+        tasks = list(db.tasks.find({'source.permit_file_id': file_id}, {'_id': 0}))
+        
+        # Group tasks by stage
+        tasks_by_stage = {}
+        for task in tasks:
+            stage = task.get('stage', 'UNKNOWN')
+            if stage not in tasks_by_stage:
+                tasks_by_stage[stage] = []
+            tasks_by_stage[stage].append({
+                'task_id': task.get('task_id'),
+                'title': task.get('title'),
+                'assigned_to': task.get('assigned_to_name'),
+                'status': task.get('status'),
+                'completed_at': task.get('completed_at')
+            })
+        
+        return {
+            'file_id': file_id,
+            'file_name': file_doc.get('file_info', {}).get('original_filename'),
+            'uploaded_at': file_doc.get('file_info', {}).get('uploaded_at'),
+            'versions': file_doc.get('version_history', []),
+            'current_stage': tracking.get('current_stage') if tracking else None,
+            'current_status': tracking.get('current_status') if tracking else None,
+            'stage_history': tracking.get('stage_history', []) if tracking else [],
+            'tasks_by_stage': tasks_by_stage,
+            'total_tasks': len(tasks),
+            'project_details': file_doc.get('project_details', {})
+        }
     
     @staticmethod
     def consolidate_duplicate_files(target_file_id: str, duplicate_file_ids: List[str]) -> bool:

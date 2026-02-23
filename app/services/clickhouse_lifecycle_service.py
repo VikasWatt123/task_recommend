@@ -5,7 +5,7 @@ import json
 import uuid
 from datetime import datetime
 from typing import Dict, List, Any, Optional
-from app.services.clickhouse_service import clickhouse_service
+from app.services.clickhouse_service import CLICKHOUSE_ENABLED, clickhouse_service
 import logging
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,10 @@ class ClickHouseLifecycleService:
                                  employee_name: str = None, 
                                  event_data: Dict = None):
         """Emit a file lifecycle event to ClickHouse"""
+        
+        if not CLICKHOUSE_ENABLED:
+            logger.info(f"ClickHouse disabled - skipping lifecycle event for {file_id}")
+            return
         
         try:
             # Get previous state for context
@@ -54,6 +58,9 @@ class ClickHouseLifecycleService:
 
     def _get_current_state(self, file_id: str) -> Optional[Dict]:
         """Get current state of a file"""
+        if not CLICKHOUSE_ENABLED:
+            return None
+        
         try:
             query = "SELECT * FROM task_analytics.file_current_state WHERE file_id = %(file_id)s LIMIT 1"
             result = clickhouse_service.client.execute(query, {'file_id': file_id})
@@ -64,6 +71,9 @@ class ClickHouseLifecycleService:
 
     def _update_current_state(self, file_id: str, event_type: str, event: Dict, previous_state: Dict):
         """Update the current state table"""
+        if not CLICKHOUSE_ENABLED:
+            return
+        
         try:
             now = datetime.utcnow()
             
@@ -75,19 +85,18 @@ class ClickHouseLifecycleService:
                     'current_status': f"IN_{event['stage']}",
                     'current_employee_code': event['employee_code'],
                     'current_employee_name': event['employee_name'],
-                    'stage_started_at': event['event_time'],
-                    'last_updated_at': now,
-                    'stage_duration_minutes': 0,
-                    'sla_status': 'within_ideal'
+                    'last_updated': now,
+                    'total_duration_minutes': previous_state.get('total_duration_minutes', 0) if previous_state else 0
                 }
             elif event_type == 'STAGE_COMPLETED':
                 # Stage completed
-                total_duration = previous_state.get('total_duration_minutes', 0) + previous_state.get('stage_duration_minutes', 0)
+                total_duration = previous_state.get('total_duration_minutes', 0) if previous_state else 0
+                # We don't have stage_duration_minutes in previous_state, so we just use what's there
                 state_update = {
                     'file_id': file_id,
-                    'current_stage': previous_state.get('current_stage'),
+                    'current_stage': previous_state.get('current_stage') if previous_state else None,
                     'current_status': 'COMPLETED',
-                    'last_updated_at': now,
+                    'last_updated': now,
                     'total_duration_minutes': total_duration
                 }
             elif event_type == 'FILE_DELIVERED':
@@ -96,13 +105,13 @@ class ClickHouseLifecycleService:
                     'file_id': file_id,
                     'current_stage': 'DELIVERED',
                     'current_status': 'DELIVERED',
-                    'last_updated_at': now
+                    'last_updated': now
                 }
             else:
                 # Other events - just update timestamp
                 state_update = {
                     'file_id': file_id,
-                    'last_updated_at': now
+                    'last_updated': now
                 }
             
             clickhouse_service.client.execute(
