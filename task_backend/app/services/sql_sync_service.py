@@ -56,31 +56,16 @@ class SQLToMongoSyncService:
     
     def map_sql_to_mongo_employee(self, sql_employee: Dict[str, Any]) -> Dict[str, Any]:
         """Map SQL employee data to MongoDB format"""
-        # Try to find the employee code field
-        code_field = None
-        for field in ['kekaemployeecode', 'employee_code', 'emp_code', 'code']:
-            if field in sql_employee:
-                code_field = field
-                break
-        
-        if not code_field:
+        # Use kekaemployeenumber (not kekaemployeecode)
+        kekaemployeenumber = sql_employee.get('kekaemployeenumber')
+        if not kekaemployeenumber:
             return None
         
-        # Map common fields (adjust field names as needed)
+        # Map only the 3 fields that exist in up_users
         mapped_employee = {
-            "kekaemployeecode": sql_employee.get(code_field),
-            "employee_name": sql_employee.get('employee_name') or sql_employee.get('name') or sql_employee.get('emp_name'),
-            "date_of_birth": sql_employee.get('date_of_birth') or sql_employee.get('dob'),
-            "joining_date": sql_employee.get('joining_date') or sql_employee.get('join_date') or sql_employee.get('hire_date'),
-            "experience_years": float(sql_employee.get('experience_years', 0)),
-            "current_role": sql_employee.get('current_role') or sql_employee.get('role') or sql_employee.get('position'),
-            "contact_email": sql_employee.get('contact_email') or sql_employee.get('email'),
-            "shift": sql_employee.get('shift'),
-            "status_1": sql_employee.get('status_1') or sql_employee.get('status') or sql_employee.get('employment_status'),
-            "status_2": sql_employee.get('status_2'),
-            "status_3": sql_employee.get('status_3'),
-            # Map reporting manager
-            "reporting_manager": sql_employee.get('reporting_manager') or sql_employee.get('manager_code') or sql_employee.get('reporting_manager_kekaemployeecode'),
+            "kekaemployeecode": kekaemployeenumber,  # Map kekaemployeenumber to kekaemployeecode
+            "employee_name": sql_employee.get('fullname'),  # Use fullname field
+            "contact_email": sql_employee.get('email'),  # Use email field
             # Sync metadata
             "sync_info": {
                 "sql_source": True,
@@ -157,48 +142,40 @@ class SQLToMongoSyncService:
             return None
     
     async def sync_employee_update(self, sql_employee: Dict[str, Any]) -> Dict[str, Any]:
-        """Sync employee updates from SQL to MongoDB"""
+        """Update existing employee with SQL data (only email and fullname)"""
         try:
             db = get_db()
             mapped_employee = self.map_sql_to_mongo_employee(sql_employee)
             if not mapped_employee:
                 return None
+            
             kekaemployeecode = mapped_employee["kekaemployeecode"]
             
-            # Get existing employee
+            # Get existing employee from MongoDB
             existing_employee = db.employee.find_one({"kekaemployeecode": kekaemployeecode})
             
             if not existing_employee:
-                # Employee doesn't exist, create them
-                return await self.sync_new_employee(sql_employee)
+                logger.warning(f"Employee {kekaemployeecode} not found in MongoDB for update")
+                return None
             
-            # Update only SQL master data fields, preserve MongoDB-specific data
-            update_data = {k: v for k, v in mapped_employee.items() if k not in ["kekaemployeecode", "skills", "technical_skills", "embedding"]}
-            
-            # Preserve existing MongoDB-specific data
-            preserved_fields = [
-                "skills", "technical_skills", "raw_technical_skills", "raw_strength_expertise",
-                "embedding", "metadata", "list_of_task_assigned", "special_task",
-                "onboarding", "tasks_assigned", "performance_metrics"
-            ]
-            
-            for field in preserved_fields:
-                if field in existing_employee:
-                    update_data[field] = existing_employee[field]
-            
-            # Update sync info
-            update_data["sync_info"] = {
-                "sql_source": True,
-                "last_synced": datetime.utcnow(),
-                "sync_version": existing_employee.get("sync_info", {}).get("sync_version", 0) + 1
+            # Only update the 3 fields from SQL, preserve everything else
+            update_data = {
+                "employee_name": mapped_employee.get("employee_name"),
+                "contact_email": mapped_employee.get("contact_email"),
+                "sync_info": {
+                    "sql_source": True,
+                    "last_synced": datetime.utcnow(),
+                    "sync_version": existing_employee.get("sync_info", {}).get("sync_version", 0) + 1
+                }
             }
             
+            # Perform update
             db.employee.update_one(
                 {"kekaemployeecode": kekaemployeecode},
                 {"$set": update_data}
             )
             
-            logger.info(f"Updated employee {kekaemployeecode} from SQL")
+            logger.info(f"Updated employee {kekaemployeecode} with SQL data (email, fullname)")
             return mapped_employee
             
         except Exception as e:
@@ -206,46 +183,67 @@ class SQLToMongoSyncService:
             raise
     
     async def sync_all_employees(self) -> Dict[str, Any]:
-        """Perform full sync of all employees from SQL to MongoDB"""
+        """Sync existing MongoDB employees with SQL data (no new employees created)"""
         try:
-            logger.info("Starting full employee sync from SQL to MongoDB")
-            
-            sql_employees = self.mysql_service.get_all_employees(self.employee_table_name)
-            sync_results = {
-                "total_sql_employees": len(sql_employees),
-                "synced": 0,
-                "updated": 0,
-                "created": 0,
-                "errors": []
-            }
+            logger.info("Starting employee sync from SQL to MongoDB (existing employees only)")
             
             db = get_db()
             
-            for sql_emp in sql_employees:
+            # Step 1: Get all existing employees from MongoDB
+            mongo_employees = list(db.employee.find({}, {"kekaemployeecode": 1}))
+            mongo_employee_codes = {emp["kekaemployeecode"] for emp in mongo_employees}
+            
+            sync_results = {
+                "total_mongo_employees": len(mongo_employees),
+                "matched_in_sql": 0,
+                "updated": 0,
+                "not_found_in_sql": [],
+                "errors": []
+            }
+            
+            if not mongo_employee_codes:
+                logger.info("No employees found in MongoDB to sync")
+                return sync_results
+            
+            # Step 2: Fetch only matching employees from SQL
+            # Build WHERE clause for kekaemployeenumber
+            employee_codes_list = list(mongo_employee_codes)
+            placeholders = ', '.join(['%s'] * len(employee_codes_list))
+            
+            sql_employees = []
+            with self.mysql_service.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    query = f"SELECT kekaemployeenumber, fullname, email FROM {self.employee_table_name} WHERE kekaemployeenumber IN ({placeholders})"
+                    cursor.execute(query, employee_codes_list)
+                    sql_employees = cursor.fetchall()
+            
+            # Create a mapping of kekaemployeenumber to employee data
+            sql_employee_map = {emp['kekaemployeenumber']: emp for emp in sql_employees}
+            
+            # Step 3: Update only existing MongoDB employees
+            for kekaemployeecode in mongo_employee_codes:
                 try:
-                    mapped_employee = self.map_sql_to_mongo_employee(sql_emp)
-                    if not mapped_employee:
-                        continue  # Skip records that don't have employee code fields
-                    kekaemployeecode = mapped_employee["kekaemployeecode"]
+                    sql_emp = sql_employee_map.get(kekaemployeecode)
                     
-                    existing_employee = db.employee.find_one({"kekaemployeecode": kekaemployeecode})
-                    
-                    if existing_employee:
+                    if sql_emp:
+                        # Employee found in SQL, update MongoDB
                         await self.sync_employee_update(sql_emp)
                         sync_results["updated"] += 1
+                        sync_results["matched_in_sql"] += 1
                     else:
-                        await self.sync_new_employee(sql_emp)
-                        sync_results["created"] += 1
-                    
-                    sync_results["synced"] += 1
+                        # Employee not found in SQL
+                        sync_results["not_found_in_sql"].append(kekaemployeecode)
+                        logger.warning(f"Employee {kekaemployeecode} not found in SQL table")
                     
                 except Exception as e:
-                    sync_results["errors"].append(f"Sync error: {e}")
-            logger.info(f"Full sync completed: {sync_results['synced']} synced, {sync_results['created']} created, {sync_results['updated']} updated")
+                    sync_results["errors"].append(f"Sync error for {kekaemployeecode}: {e}")
+                    logger.error(f"Error syncing employee {kekaemployeecode}: {e}")
+            
+            logger.info(f"Sync completed: {sync_results['updated']} updated, {sync_results['matched_in_sql']} matched in SQL, {len(sync_results['not_found_in_sql'])} not found")
             return sync_results
             
         except Exception as e:
-            logger.error(f"Full sync failed: {e}")
+            logger.error(f"Employee sync failed: {e}")
             raise
     
     async def _trigger_skills_collection(self, kekaemployeecode: str, employee_name: str):

@@ -149,3 +149,26 @@ async def test_mysql_connection():
             "error": str(e),
             "timestamp": datetime.utcnow().isoformat()
         }
+
+@router.post("/sync-employees")
+async def manual_sync_employees():
+    """Manually trigger employee sync from MySQL to MongoDB"""
+    try:
+        logger.info("Manual employee sync triggered by user")
+        
+        # Perform the sync
+        result = await sync_service.sync_all_employees()
+        
+        return {
+            "status": "success",
+            "message": "Employee sync completed",
+            "sync_result": result,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Manual employee sync failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync employees: {str(e)}"
+        )

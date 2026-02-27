@@ -117,9 +117,10 @@ async def startup_event():
             if sql_sync_service.mysql_service.test_mysql_connection():
                 logger.info("✅ MySQL connection successful")
                 
-                # Start backup sync service
-                asyncio.create_task(backup_sync_service.start_periodic_sync())
-                logger.info("✅ Backup sync service started")
+                # Periodic sync disabled - only manual sync available
+                logger.info("ℹ️  Periodic employee sync disabled (manual only)")
+                # asyncio.create_task(backup_sync_service.start_periodic_sync())
+                # logger.info("✅ Backup sync service started")
             else:
                 logger.error("❌ MySQL connection failed")
                 

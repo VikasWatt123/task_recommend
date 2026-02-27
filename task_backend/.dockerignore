@@ -1,60 +1,72 @@
 # ======================
-# Git
+# Virtual Environment (CRITICAL)
 # ======================
-.git
-.gitignore
+venv/
+/home/user/smart_task_assignee/task_recommend/task_backend/venv
+env/
+.venv/
+ENV/
 
 # ======================
-# Python
+# Uploaded files (CRITICAL)
+# ======================
+uploads/
+
+# ======================
+# Python cache
 # ======================
 __pycache__/
 *.py[cod]
 *.so
 .Python
-env/
-venv/
-ENV/
-.venv/
-
-# ======================
-# IDE
-# ======================
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# ======================
-# Docker
-# ======================
-Dockerfile
-docker-compose*.yml
-.dockerignore
 
 # ======================
 # Logs
 # ======================
 logs/
 *.log
+server.log
+worker.log
+frontend.log
 
 # ======================
-# Testing
+# Database files
 # ======================
-.coverage
-htmlcov/
-.pytest_cache/
+*.db
+*.sqlite
+*.sqlite3
+temporal.db
 
 # ======================
-# Frontend
+# Scripts and tests
 # ======================
-frontend/node_modules/
-frontend/build/
-frontend/dist/
+scripts/
+test_*.py
 
 # ======================
-# Node
+# Secrets (CRITICAL)
 # ======================
-node_modules/
+prod-key.pem
+service_account_key.json
+*.pem
+*.key
+
+# ======================
+# Git
+# ======================
+.git
+.gitignore
+
+# ======================
+# IDE
+# ======================
+.vscode/
+.idea/
+
+# ======================
+# Documentation
+# ======================
+*.md
 
 # ======================
 # OS
@@ -63,9 +75,6 @@ node_modules/
 Thumbs.db
 
 # ======================
-# Temp
+# Docker ignore self
 # ======================
-*.tmp
-*.temp
-test_stage.py
-test_stage_local.py
+.dockerignore

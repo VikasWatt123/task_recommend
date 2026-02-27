@@ -10,6 +10,7 @@ from clickhouse_driver import Client
 from app.db.mongodb import get_db
 import pandas as pd
 import re
+from app.core.settings import settings
 
 # Import SLA constants
 from app.constants.sla import STAGE_SLA_THRESHOLDS
@@ -31,9 +32,9 @@ class ClickHouseService:
         if CLICKHOUSE_ENABLED:
             try:
                 self.client = Client(
-                    host='localhost',
-                    port=9000,
-                    database='task_analytics',
+                    host=settings.clickhouse_host,
+                    port=settings.clickhouse_port,
+                    database=settings.clickhouse_database,
                     # Add authentication if needed
                     # user='default',
                     # password='',

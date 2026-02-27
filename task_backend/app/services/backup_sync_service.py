@@ -16,9 +16,10 @@ class BackupSyncService:
     
     def __init__(self):
         self.sync_service = sync_service
+        self.last_sync_time: Optional[datetime] = None
+        self.sync_interval_minutes = 10080  # Sync every week (7 days = 10080 minutes)
         self.is_running = False
-        self.last_sync_time = None
-        self.sync_interval_minutes = 10  # Sync every 10 minutes
+        self.sync_task: Optional[asyncio.Task] = None
     
     async def start_periodic_sync(self):
         """Start the periodic sync process"""

@@ -36,6 +36,15 @@ class MySQLService:
     def test_ssh_connection(self) -> bool:
         """Test SSH connection to remote server"""
         try:
+            # Check if SSH is configured
+            if not self.ssh_host or not self.ssh_key_path:
+                logger.info("SSH not configured (Docker environment)")
+                return True
+                
+            if not os.path.exists(self.ssh_key_path):
+                logger.warning(f"SSH key file not found: {self.ssh_key_path}")
+                return False
+                
             # Load SSH private key
             private_key = paramiko.RSAKey.from_private_key_file(self.ssh_key_path)
             
@@ -74,29 +83,41 @@ class MySQLService:
         connection = None
         
         try:
-            # Load SSH private key
-            private_key = paramiko.RSAKey.from_private_key_file(self.ssh_key_path)
-            
-            # Create SSH tunnel
-            ssh_tunnel = SSHTunnelForwarder(
-                (self.ssh_host, self.ssh_port),
-                ssh_username=self.ssh_username,
-                ssh_pkey=private_key,
-                remote_bind_address=(self.mysql_host, self.mysql_port)
-            )
-            ssh_tunnel.start()
-            
-            # Connect to MySQL through SSH tunnel
-            connection = pymysql.connect(
-                host='127.0.0.1',
-                port=ssh_tunnel.local_bind_port,
-                user=self.mysql_username,
-                password=self.mysql_password,
-                database=self.mysql_database,
-                charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor
-            )
-            
+            # Check if SSH tunneling is needed (not needed for Docker environments)
+            if self.ssh_host and self.ssh_key_path and os.path.exists(self.ssh_key_path):
+                # Load SSH private key
+                private_key = paramiko.RSAKey.from_private_key_file(self.ssh_key_path)
+                
+                ssh_tunnel = SSHTunnelForwarder(
+                    (self.ssh_host, self.ssh_port),
+                    ssh_username=self.ssh_username,
+                    ssh_pkey=private_key,
+                    remote_bind_address=(self.mysql_host, self.mysql_port)
+                )
+                ssh_tunnel.start()
+                
+                # Connect to MySQL through SSH tunnel
+                connection = pymysql.connect(
+                    host='127.0.0.1',
+                    port=ssh_tunnel.local_bind_port,
+                    user=self.mysql_username,
+                    password=self.mysql_password,
+                    database=self.mysql_database,
+                    cursorclass=pymysql.cursors.DictCursor,
+                    charset='utf8mb4'
+                )
+            else:
+                # Direct connection (for Docker environments)
+                logger.info("Connecting directly to MySQL (Docker environment)")
+                connection = pymysql.connect(
+                    host=self.mysql_host,
+                    port=self.mysql_port,
+                    user=self.mysql_username,
+                    password=self.mysql_password,
+                    database=self.mysql_database,
+                    cursorclass=pymysql.cursors.DictCursor,
+                    charset='utf8mb4'
+                )
             yield connection
             
         except Exception as e:
@@ -157,17 +178,9 @@ class MySQLService:
         
         with self.get_connection() as conn:
             with conn.cursor() as cursor:
-                # Try different possible column names for employee code
-                possible_code_columns = ['kekaemployeecode', 'employee_code', 'emp_code', 'code']
-                
-                for col_name in possible_code_columns:
-                    try:
-                        cursor.execute(f"SELECT * FROM {table_name} WHERE {col_name} = %s", (employee_code,))
-                        return cursor.fetchone()
-                    except:
-                        continue
-                
-                return None
+                # Use kekaemployeenumber field directly
+                cursor.execute(f"SELECT * FROM {table_name} WHERE kekaemployeenumber = %s", (employee_code,))
+                return cursor.fetchone()
     
     def get_permit_files(self, table_name: str = None) -> List[Dict[str, Any]]:
         """Get permit files from SQL database"""

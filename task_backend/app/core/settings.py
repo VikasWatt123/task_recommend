@@ -1,67 +1,28 @@
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
-
+import os
 
 class Settings(BaseSettings):
-    env: str = "development"
-    app_name: str = "task_assignee"
-    log_level: str = "INFO"
 
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    mongodb_uri: str = "mongodb://localhost:27017"  # Default, will be overridden by .env
-    mongodb_url: str = Field(default="mongodb://localhost:27017", alias="mongodb_uri")  # For compatibility
-    mongodb_db: str = "task_assignee"
-
-    redis_url: str = "redis://localhost:6379/0"
-
-    uploads_dir: str = "uploads"
-
-    # RBAC bypass for testing (set to true to disable auth enforcement)
-    disable_rbac: bool = False
-
-    jwt_secret: str = "change_me"
-    jwt_algorithm: str = Field("HS256", env="JWT_ALGORITHM")
-    access_token_expire_minutes: int = 60
-    refresh_token_expire_days: int = 7
-
-    openai_api_key: str | None = None
-    gemini_api_key: str | None = None
+    app_name: str = Field(default="Task Assignment System", alias="APP_NAME")
+    uploads_dir: str = Field(default="uploads", alias="UPLOADS_DIR")
     
-    # Vertex AI settings
-    use_vertex_ai: bool = False
-    vertex_ai_project_id: str | None = None
-    vertex_ai_region: str = "us-central1"
-    vertex_ai_model_name: str = "gemini-2.0-flash"
-    vertex_ai_embedding_model_name: str = "text-embedding-004"
-    
-    # Additional Vertex AI fields from .env
-    google_application_credentials: str | None = None
-    gemini_embedding_model: str | None = None
-    gemini_embedding_dimension: int | None = None
-    project_id: str | None = None
-    location: str | None = None
-    
-    # MySQL Configuration
-    mysql_host: str | None = None
-    mysql_port: int = 3306
-    mysql_database: str | None = None
-    mysql_user: str | None = None
-    mysql_password: str | None = None
-    
-    # MySQL SSH Configuration
-    mysql_ssh_host: str | None = None
-    mysql_ssh_port: int = 22
-    mysql_ssh_user: str | None = None
-    mysql_ssh_key_path: str = "prod-key.pem"
-    
-    # ClickHouse Configuration
-    clickhouse_host: str = Field(default="localhost")
-    clickhouse_port: int = Field(default=9000)
-    clickhouse_database: str = Field(default="task_analytics")
+    mongodb_uri: str = Field(default="mongodb://mongodb:27017", alias="MONGODB_URL")
+    mongodb_db: str = Field(default="task_assignee", alias="MONGODB_DB")
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
+    mysql_host: str = Field(default="mysql", alias="MYSQL_HOST")
+    mysql_port: int = Field(default=3306, alias="MYSQL_PORT")
+    mysql_database: str = Field(default="permits_db", alias="MYSQL_DATABASE")
+    mysql_user: str = Field(default="task_user", alias="MYSQL_USER")
+    mysql_password: str = Field(default="task_password", alias="MYSQL_PASSWORD")
+    mysql_ssh_host: str | None = Field(default=None, alias="MYSQL_SSH_HOST")
+    mysql_ssh_port: int = Field(default=22, alias="MYSQL_SSH_PORT")
+    mysql_ssh_user: str = Field(default="root", alias="MYSQL_SSH_USER")
+    mysql_ssh_key_path: str = Field(default="/home/user/smart_task_assignee/task_recommend/prod-key.pem", alias="MYSQL_SSH_KEY_PATH")
 
+    clickhouse_host: str = Field(default="clickhouse", alias="CLICKHOUSE_HOST")
+    clickhouse_port: int = Field(default=9000, alias="CLICKHOUSE_PORT")
+    clickhouse_database: str = Field(default="task_analytics", alias="CLICKHOUSE_DATABASE")
 
 settings = Settings()
